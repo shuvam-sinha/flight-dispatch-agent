@@ -46,6 +46,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=5,
         help="Maximum intermediate waypoints (default: 5)",
     )
+    parser.add_argument(
+        "--map",
+        metavar="PATH",
+        nargs="?",
+        const="route_map.html",
+        help="Write an interactive HTML map (default filename: route_map.html)",
+    )
     return parser.parse_args(argv)
 
 
@@ -155,6 +162,15 @@ def main(argv=None) -> int:
     )
 
     print(format_plan(plan))
+
+    # Map rendering is optional, so folium is imported only when asked
+    # for. That keeps the routing engine usable without it installed.
+    if args.map:
+        from flight_dispatch.mapping import save_route_map
+
+        written = save_route_map(plan, args.map)
+        print(f"\nMap written to {written}")
+
     return 0  # exit status 0 = success
 
 
