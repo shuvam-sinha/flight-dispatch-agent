@@ -27,7 +27,7 @@ import csv
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from .geo import bounding_box
+from .geo import bounding_box, longitude_within, route_bounding_box
 from .models import Airport, Navaid
 
 # __file__ is this file; .parents[1] walks up from flight_dispatch/ to the
@@ -180,7 +180,40 @@ def navaids_in_bounds(
     return [
         navaid
         for navaid in navaids
-        if min_lat <= navaid.lat <= max_lat and min_lon <= navaid.lon <= max_lon
+        if min_lat <= navaid.lat <= max_lat
+        and longitude_within(navaid.lon, min_lon, max_lon)
+    ]
+
+
+def navaids_near_route(
+    navaids: Iterable[Navaid],
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+    margin_nm: float = 100.0,
+) -> List[Navaid]:
+    """Narrow a navaid list to a corridor around the great-circle path.
+
+    Like `navaids_in_bounds`, but boxes the ACTUAL flown path rather than
+    just its endpoints, so the poleward bulge of a long great circle is
+    not cut off. See `geo.route_bounding_box` for why that matters.
+
+    This is what CP2's mesh construction uses. The margin is wider than
+    the CP1 default because the graph needs room to route AROUND things
+    -- a corridor hugging the direct course would leave A* no alternative
+    paths to consider, and CP3 needs somewhere to detour when restricted
+    airspace blocks the direct line.
+    """
+    min_lat, min_lon, max_lat, max_lon = route_bounding_box(
+        lat1, lon1, lat2, lon2, margin_nm
+    )
+
+    return [
+        navaid
+        for navaid in navaids
+        if min_lat <= navaid.lat <= max_lat
+        and longitude_within(navaid.lon, min_lon, max_lon)
     ]
 
 

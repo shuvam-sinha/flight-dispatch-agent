@@ -1,7 +1,8 @@
 import unittest
 
 from flight_dispatch.models import Airport, Navaid
-from flight_dispatch.route import naive_route
+from flight_dispatch.geo import haversine_nm
+from flight_dispatch.route import naive_route, plan_route
 
 # A long westbound leg gives room for intermediate waypoints.
 ORIGIN = Airport(icao="KPWK", name="Chicago Executive", lat=42.1142, lon=-87.9014)
@@ -105,6 +106,80 @@ class TestRoutePlanDistances(unittest.TestCase):
         offset = navaid("OFFSET", 44.05, -90.62)
         plan = naive_route(ORIGIN, DEST, [offset], corridor_width_nm=60.0)
         self.assertGreater(plan.total_distance_nm, plan.direct_distance_nm)
+
+
+class TestPlanRouteAStar(unittest.TestCase):
+    """CP2 routing. The contrast with naive_route is the point."""
+
+    def line_of_navaids(self, count: int = 6) -> list:
+        """Navaids strung roughly along the KPWK->KMSP course."""
+        return [
+            navaid(f"W{i}", 42.1142 + i * 0.46, -87.9014 - i * 0.89)
+            for i in range(1, count + 1)
+        ]
+
+    def test_route_starts_and_ends_at_the_airports(self):
+        plan = plan_route(ORIGIN, DEST, self.line_of_navaids())
+        self.assertIs(plan.waypoints[0], ORIGIN)
+        self.assertIs(plan.waypoints[-1], DEST)
+
+    def test_beats_naive_on_the_short_leg_dogleg(self):
+        # The CP1 failure case: a corridor wider than the flight is long.
+        near_ord = Airport(icao="KORD", name="O'Hare", lat=41.9786, lon=-87.9048)
+        scattered = [
+            navaid("E1", 41.98, -87.60),
+            navaid("E2", 42.06, -88.00),
+            navaid("E3", 42.05, -88.01),
+        ]
+        astar = plan_route(ORIGIN, near_ord, scattered)
+        naive = naive_route(ORIGIN, near_ord, scattered, corridor_width_nm=15)
+
+        self.assertLess(astar.total_distance_nm, naive.total_distance_nm)
+        # With nothing to gain from a detour, A* should fly it direct.
+        self.assertAlmostEqual(
+            astar.total_distance_nm, astar.direct_distance_nm, delta=0.01
+        )
+
+    def test_never_longer_than_the_direct_course_by_much(self):
+        plan = plan_route(ORIGIN, DEST, self.line_of_navaids())
+        self.assertLess(plan.total_distance_nm, plan.direct_distance_nm * 1.05)
+
+    def test_no_navaids_still_routes_directly(self):
+        plan = plan_route(ORIGIN, DEST, [])
+        self.assertEqual([wp.ident for wp in plan.waypoints], ["KPWK", "KMSP"])
+        self.assertAlmostEqual(
+            plan.total_distance_nm, plan.direct_distance_nm, places=6
+        )
+
+    def test_reports_search_diagnostics(self):
+        plan = plan_route(ORIGIN, DEST, self.line_of_navaids())
+        self.assertEqual(plan.graph_nodes, 8)  # 6 navaids + origin + dest
+        self.assertGreater(plan.graph_edges, 0)
+        self.assertGreaterEqual(plan.nodes_expanded, 1)
+
+    def test_naive_route_leaves_diagnostics_unset(self):
+        plan = naive_route(ORIGIN, DEST, self.line_of_navaids())
+        self.assertIsNone(plan.graph_nodes)
+        self.assertIsNone(plan.nodes_expanded)
+
+    def test_larger_radius_never_produces_a_longer_route(self):
+        navaids = self.line_of_navaids(10)
+        tight = plan_route(ORIGIN, DEST, navaids, radius_nm=60)
+        loose = plan_route(ORIGIN, DEST, navaids, radius_nm=300)
+        self.assertLessEqual(
+            loose.total_distance_nm, tight.total_distance_nm + 1e-6
+        )
+
+    def test_waypoints_progress_toward_the_destination(self):
+        plan = plan_route(ORIGIN, DEST, self.line_of_navaids())
+        remaining = [
+            haversine_nm(wp.lat, wp.lon, DEST.lat, DEST.lon)
+            for wp in plan.waypoints
+        ]
+        # A shortest path over a distance-weighted mesh should never
+        # double back, so each hop must get closer to the destination.
+        for earlier, later in zip(remaining, remaining[1:]):
+            self.assertLess(later, earlier)
 
 
 if __name__ == "__main__":

@@ -18,10 +18,12 @@ and running A* over it, where a zigzag simply costs more and loses.
 """
 
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from .geo import cross_and_along_track_nm, haversine_nm
+from .graph import DEFAULT_MIN_NEIGHBORS, DEFAULT_RADIUS_NM, WaypointGraph, build_mesh
 from .models import Airport, Navaid, Waypoint
+from .search import a_star
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,13 @@ class RoutePlan:
     origin: Airport
     dest: Airport
     waypoints: List[Waypoint]  # includes origin at [0] and dest at [-1]
+
+    # Search diagnostics, populated by plan_route and left as None by the
+    # CP1 naive_route (which does no searching). Kept on the plan so the
+    # CLI can report them without re-running anything.
+    graph_nodes: Optional[int] = None
+    graph_edges: Optional[int] = None
+    nodes_expanded: Optional[int] = None
 
     @property
     def direct_distance_nm(self) -> float:
@@ -131,6 +140,69 @@ def naive_route(
     selected = _spread_evenly(candidates, total_nm, max_waypoints)
 
     return RoutePlan(origin=origin, dest=dest, waypoints=[origin, *selected, dest])
+
+
+class NoRouteFound(Exception):
+    """Raised when no path exists through the mesh between two airports."""
+
+
+def plan_route(
+    origin: Airport,
+    dest: Airport,
+    navaids: Sequence[Navaid],
+    radius_nm: float = DEFAULT_RADIUS_NM,
+    min_neighbors: int = DEFAULT_MIN_NEIGHBORS,
+) -> RoutePlan:
+    """CP2 routing: shortest path over a waypoint mesh graph.
+
+    This is what `naive_route` should have been. Instead of sampling
+    points near the direct course and connecting them in order, it builds
+    a graph of every plausible leg in the region and asks A* for the
+    cheapest way through it. A detour now has to justify itself against
+    every alternative, so the zigzags CP1 produced on short legs simply
+    lose the search.
+
+    Cost is plain great-circle distance at this checkpoint. CP3 swaps in
+    time-given-wind and blocks edges crossing restricted airspace by
+    passing a cost_function to `a_star` -- neither the graph nor the
+    search needs to change for that.
+
+    Args:
+        navaids: Candidate waypoints, pre-filtered to the region. Use
+            `data_loader.navaids_near_route` to build this.
+        radius_nm: Edge connection radius for the mesh.
+        min_neighbors: Nearest-neighbour floor, so sparse regions cannot
+            fragment the graph.
+
+    Raises:
+        NoRouteFound: if the mesh has no path between origin and dest.
+    """
+    # Origin and destination join the mesh as nodes so the path has
+    # endpoints; no other airports participate, since real routes are
+    # defined navaid-to-navaid.
+    graph = build_mesh(
+        [origin, *navaids, dest],
+        radius_nm=radius_nm,
+        min_neighbors=min_neighbors,
+    )
+
+    # Origin is at index 0 and destination last, by construction above.
+    result = a_star(graph, 0, graph.node_count - 1)
+
+    if not result.found:
+        raise NoRouteFound(
+            f"No path from {origin.icao} to {dest.icao} through "
+            f"{graph.node_count} waypoints. Try a larger --radius-nm."
+        )
+
+    return RoutePlan(
+        origin=origin,
+        dest=dest,
+        waypoints=[graph.nodes[i] for i in result.path],
+        graph_nodes=graph.node_count,
+        graph_edges=graph.edge_count,
+        nodes_expanded=result.nodes_expanded,
+    )
 
 
 def _spread_evenly(

@@ -4,8 +4,10 @@ from flight_dispatch.geo import (
     bounding_box,
     cross_and_along_track_nm,
     cross_track_nm,
+    great_circle_point,
     haversine_nm,
     initial_bearing_deg,
+    route_bounding_box,
 )
 
 # Chicago Executive and O'Hare: a short, real, roughly north-south leg.
@@ -108,6 +110,72 @@ class TestBoundingBox(unittest.TestCase):
         # A degree of longitude is narrower up north, so the box needs more
         # degrees to cover the same distance.
         self.assertLess(far_north_lon_pad, equator_lon_pad)
+
+
+class TestGreatCirclePoint(unittest.TestCase):
+    def test_endpoints(self):
+        start = great_circle_point(0.0, 40.0, -90.0, 50.0, -80.0)
+        end = great_circle_point(1.0, 40.0, -90.0, 50.0, -80.0)
+        self.assertAlmostEqual(start[0], 40.0, places=6)
+        self.assertAlmostEqual(start[1], -90.0, places=6)
+        self.assertAlmostEqual(end[0], 50.0, places=6)
+        self.assertAlmostEqual(end[1], -80.0, places=6)
+
+    def test_midpoint_is_equidistant_from_both_ends(self):
+        mid = great_circle_point(0.5, 40.0, -90.0, 50.0, -80.0)
+        to_start = haversine_nm(*mid, 40.0, -90.0)
+        to_end = haversine_nm(*mid, 50.0, -80.0)
+        self.assertAlmostEqual(to_start, to_end, delta=0.01)
+
+    def test_along_the_equator_is_simple_interpolation(self):
+        lat, lon = great_circle_point(0.5, 0.0, 0.0, 0.0, 10.0)
+        self.assertAlmostEqual(lat, 0.0, delta=0.001)
+        self.assertAlmostEqual(lon, 5.0, delta=0.001)
+
+    def test_coincident_endpoints_do_not_divide_by_zero(self):
+        point = great_circle_point(0.5, 40.0, -90.0, 40.0, -90.0)
+        self.assertEqual(point, (40.0, -90.0))
+
+    def test_midpoint_bulges_poleward_of_both_endpoints(self):
+        # The signature property of a great circle: on an east-west leg
+        # at mid latitudes, the path arcs closer to the pole than either
+        # end. This is what route_bounding_box exists to capture.
+        lat, _ = great_circle_point(0.5, 51.0, -60.0, 51.0, 0.0)
+        self.assertGreater(lat, 51.0)
+
+
+class TestRouteBoundingBox(unittest.TestCase):
+    def test_contains_the_endpoints(self):
+        min_lat, min_lon, max_lat, max_lon = route_bounding_box(
+            40.0, -90.0, 50.0, -80.0, margin_nm=0.0
+        )
+        for lat, lon in ((40.0, -90.0), (50.0, -80.0)):
+            self.assertTrue(min_lat <= lat <= max_lat)
+            self.assertTrue(min_lon <= lon <= max_lon)
+
+    def test_captures_the_bulge_that_the_endpoint_box_misses(self):
+        # KJFK -> EGLL: endpoints top out at 51.47N, the flown path near
+        # 53.7N. The plain endpoint box cuts that off; this one must not.
+        args = (40.6413, -73.7781, 51.4706, -0.4619)
+        endpoint_box = bounding_box(*args, margin_nm=0.0)
+        path_box = route_bounding_box(*args, margin_nm=0.0)
+
+        self.assertGreater(path_box[2], endpoint_box[2])
+        self.assertGreater(path_box[2], 53.0)
+
+    def test_matches_the_endpoint_box_on_a_north_south_leg(self):
+        # A leg straight along a meridian has no bulge, so both boxes
+        # should agree.
+        args = (30.0, -90.0, 45.0, -90.0)
+        endpoint_box = bounding_box(*args, margin_nm=0.0)
+        path_box = route_bounding_box(*args, margin_nm=0.0)
+        self.assertAlmostEqual(path_box[0], endpoint_box[0], places=6)
+        self.assertAlmostEqual(path_box[2], endpoint_box[2], places=6)
+
+    def test_margin_widens_the_box(self):
+        tight = route_bounding_box(40.0, -90.0, 50.0, -80.0, margin_nm=0.0)
+        padded = route_bounding_box(40.0, -90.0, 50.0, -80.0, margin_nm=60.0)
+        self.assertAlmostEqual(tight[0] - padded[0], 1.0, delta=0.01)
 
 
 if __name__ == "__main__":
