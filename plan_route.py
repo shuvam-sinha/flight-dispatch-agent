@@ -17,6 +17,13 @@ from flight_dispatch.data_loader import (
     load_navaids,
     navaids_near_route,
 )
+from flight_dispatch.aircraft import (
+    AIRCRAFT as AIRCRAFT_KEYS,
+    DEFAULT_AIRCRAFT,
+    AircraftProfile,
+    aircraft_by_category,
+    get_aircraft,
+)
 from flight_dispatch.geo import haversine_nm, initial_bearing_deg
 from flight_dispatch.graph import DEFAULT_RADIUS_NM
 from flight_dispatch.models import Airport
@@ -33,8 +40,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plan a naive waypoint route between two airports (CP1)."
     )
-    parser.add_argument("--origin", required=True, help="Origin ICAO code, e.g. KPWK")
-    parser.add_argument("--dest", required=True, help="Destination ICAO code, e.g. KORD")
+    # --list-aircraft prints a catalogue and exits, so origin/dest cannot
+    # be unconditionally required. They are checked in main() instead.
+    parser.add_argument("--origin", help="Origin ICAO code, e.g. KPWK")
+    parser.add_argument("--dest", help="Destination ICAO code, e.g. KORD")
+    parser.add_argument(
+        "--aircraft",
+        default=DEFAULT_AIRCRAFT.key,
+        help=f"Aircraft key (default: {DEFAULT_AIRCRAFT.key}). See --list-aircraft",
+    )
+    parser.add_argument(
+        "--payload",
+        type=float,
+        help="Payload in pounds. Defaults to the aircraft's typical occupancy",
+    )
+    parser.add_argument(
+        "--list-aircraft",
+        action="store_true",
+        help="Print the aircraft catalogue and exit",
+    )
     parser.add_argument(
         "--radius-nm",
         type=float,
@@ -164,9 +188,86 @@ def format_plan(plan: RoutePlan) -> str:
     return "\n".join(lines)
 
 
+CATEGORY_LABELS = {
+    "ga": "General aviation",
+    "business": "Business",
+    "regional": "Regional jets",
+    "narrowbody": "Narrowbody airliners",
+    "widebody": "Widebody airliners",
+}
+
+
+def format_aircraft_catalogue() -> str:
+    """Render the aircraft catalogue as a grouped table.
+
+    `range` assumes the aircraft's typical occupancy, not a full cabin --
+    see AircraftProfile.typical_payload_lb for why those differ. The
+    `limit` column shows whether tank capacity or maximum takeoff weight
+    is what caps the fuel load.
+    """
+    lines = [f"{len(list(AIRCRAFT_KEYS))} aircraft. Use --aircraft KEY.", ""]
+
+    for category, profiles in aircraft_by_category().items():
+        lines.append(f"  {CATEGORY_LABELS.get(category, category)}")
+        lines.append(
+            f"    {'key':<6} {'aircraft':<26} {'TAS':>5} {'cruise':>7} "
+            f"{'seats':>6} {'range':>8}  limit"
+        )
+        for profile in profiles:
+            limit = "weight" if profile.is_weight_limited() else "tank"
+            lines.append(
+                f"    {profile.key:<6} {profile.name:<26} "
+                f"{profile.cruise_tas_kt:>4.0f}k {profile.cruise_altitude_ft/1000:>6.0f}k "
+                f"{profile.typical_occupancy:>3}/{profile.seats:<3} "
+                f"{profile.range_nm():>7.0f}n  {limit}"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_aircraft_summary(
+    aircraft: AircraftProfile, payload_lb: float
+) -> str:
+    """One-line description of the aircraft and load being planned."""
+    fuel_gal = aircraft.max_fuel_gal(payload_lb)
+    limit = "MTOW-limited" if aircraft.is_weight_limited(payload_lb) else "full tanks"
+    return (
+        f"{aircraft.name}  |  {aircraft.cruise_tas_kt:.0f} kt TAS at "
+        f"{aircraft.cruise_altitude_ft:,.0f} ft  |  payload {payload_lb:,.0f} lb  |  "
+        f"fuel {fuel_gal:,.0f} gal ({limit})  |  range {aircraft.range_nm(payload_lb):,.0f} nm"
+    )
+
+
 def main(argv=None) -> int:
     """Wire the pieces together: load -> look up -> filter -> route -> print."""
     args = parse_args(argv)
+
+    if args.list_aircraft:
+        print(format_aircraft_catalogue())
+        return 0
+
+    if not args.origin or not args.dest:
+        raise SystemExit("--origin and --dest are required (or use --list-aircraft)")
+
+    try:
+        aircraft = get_aircraft(args.aircraft)
+    except KeyError as exc:
+        raise SystemExit(str(exc).strip('"'))
+
+    payload_lb = (
+        aircraft.typical_payload_lb if args.payload is None else args.payload
+    )
+
+    # A payload heavy enough to leave no room for fuel is a real answer,
+    # not an error -- but the route below would be meaningless, so stop
+    # here and say why.
+    if aircraft.range_nm(payload_lb) <= 0:
+        raise SystemExit(
+            f"{aircraft.name} cannot carry {payload_lb:,.0f} lb and any usable fuel.\n"
+            f"Useful load is {aircraft.useful_load_lb:,.0f} lb "
+            f"(MTOW {aircraft.mtow_lb:,.0f} - empty {aircraft.empty_weight_lb:,.0f})."
+        )
 
     # Load reference data. If the CSVs were never downloaded, turn the
     # exception into a plain one-line message rather than a traceback --
@@ -204,6 +305,8 @@ def main(argv=None) -> int:
         except NoRouteFound as exc:
             raise SystemExit(str(exc))
 
+    print(format_aircraft_summary(aircraft, payload_lb))
+    print()
     print(format_plan(plan))
 
     # Map rendering is optional, so folium is imported only when asked
