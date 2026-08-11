@@ -67,6 +67,12 @@ from .wind import ConstantWindSource
 # several tools per turn, so the data is loaded lazily and kept.
 # ---------------------------------------------------------------------------
 
+# Routes longer than this return a compact route string instead of a
+# per-leg table. Sized for the on-device model's 4,096-token context: a
+# 21-waypoint transcontinental route overflowed it, losing a plan that
+# had computed correctly.
+MAX_DETAILED_WAYPOINTS = 12
+
 _CACHE: Dict[str, Any] = {}
 
 
@@ -189,7 +195,18 @@ def find_airport(query: str) -> Dict[str, Any]:
 
 
 def list_aircraft(category: Optional[str] = None) -> Dict[str, Any]:
-    """List available aircraft, so the model picks a valid key."""
+    """List available aircraft.
+
+    ONE LINE PER AIRCRAFT, NOT A DICT PER AIRCRAFT. The structured form
+    cost 1,853 tokens unfiltered -- 45% of the on-device model's entire
+    4,096-token context, spent on a catalogue when the user asked for a
+    flight plan. Conversations overflowed and lost plans that had already
+    computed correctly.
+
+    Compact strings carry the same information at a tenth the size, and a
+    model reads "c172: Cessna 172S Skyhawk, 120 kt, 8000 ft, 2 seats,
+    658 nm" as easily as the equivalent JSON object.
+    """
     profiles = list(AIRCRAFT.values())
     if category:
         profiles = [p for p in profiles if p.category == category.lower()]
@@ -201,16 +218,11 @@ def list_aircraft(category: Optional[str] = None) -> Dict[str, Any]:
 
     return {
         "count": len(profiles),
+        "format": "key: name, cruise speed, cruise altitude, seats, range",
         "aircraft": [
-            {
-                "key": p.key,
-                "name": p.name,
-                "category": p.category,
-                "cruise_speed_kt": p.cruise_tas_kt,
-                "cruise_altitude_ft": p.cruise_altitude_ft,
-                "seats": p.seats,
-                "range_nm": round(p.range_nm()),
-            }
+            f"{p.key}: {p.name}, {p.cruise_tas_kt:.0f} kt, "
+            f"{p.cruise_altitude_ft/1000:.0f}k ft, {p.typical_occupancy} seats, "
+            f"{p.range_nm():.0f} nm"
             for p in profiles
         ],
     }
@@ -328,12 +340,32 @@ def plan_flight(
         "destination": {"icao": dest_airport.icao, "name": dest_airport.name},
         "aircraft": profile.name,
         "cruise_altitude_ft": altitude,
-        "waypoints": _describe_waypoints(plan),
+        # The compact form first, and always. This is how a route is
+        # actually filed and read aloud, and it costs a handful of tokens
+        # where the per-leg table costs hundreds.
+        "route": " ".join(w.ident for w in plan.waypoints),
+        "waypoint_count": len(plan.waypoints),
         "direct_distance_nm": round(plan.direct_distance_nm, 1),
         "route_distance_nm": round(plan.total_distance_nm, 1),
         "wind_applied": use_wind,
         "airspace_avoidance_applied": avoid_airspace,
     }
+
+    # The per-leg table is only included for routes short enough to be
+    # worth reading. A transcontinental route has 21 waypoints, and the
+    # full table overflowed the on-device model's 4,096-token context --
+    # the plan was computed correctly and then lost because the result
+    # describing it would not fit. A compact route string plus totals is
+    # what the user actually needs; anyone wanting every leg can run the
+    # CLI or open the map.
+    if len(plan.waypoints) <= MAX_DETAILED_WAYPOINTS:
+        result["waypoints"] = _describe_waypoints(plan)
+    else:
+        result["waypoints_omitted"] = (
+            f"{len(plan.waypoints)} waypoints -- per-leg detail omitted to stay "
+            "within context. Report the route string and the totals; offer the "
+            "map for detail."
+        )
 
     if plan.airspace_avoided is not None:
         result["restricted_volumes_considered"] = plan.airspace_avoided
@@ -518,9 +550,11 @@ TOOLS: List[ToolSpec] = [
         name="list_aircraft",
         description=(
             "List the aircraft this system can plan for, with cruise speed, "
-            "altitude, seats and range. Call this when the user names an "
-            "aircraft loosely ('a Cessna', 'a 737') so you can pick the "
-            "correct key, or when they ask what is available."
+            "altitude, seats and range. Call this ONLY when the user asks what "
+            "aircraft are available or wants their specifications. You do NOT "
+            "need it to plan a flight -- plan_flight's aircraft parameter "
+            "already lists every valid key, so calling this first only wastes "
+            "a turn. Filter by category when you can, to keep the reply short."
         ),
         parameters={
             "category": {
