@@ -555,9 +555,18 @@ TOOLS: List[ToolSpec] = [
                 "description": "Destination ICAO code, e.g. KMSP.",
                 "required": True,
             },
+            # An enum rather than a free string, for two reasons. It stops
+            # a model inventing "cessna172" or "B737-800" and burning a
+            # turn on the error. And it is the only way an optional
+            # parameter survives on a backend whose schema cannot express
+            # optionality -- see backend_apple._is_exposed.
             "aircraft": {
                 "type": "string",
-                "description": "Aircraft key from list_aircraft. Defaults to c172 (Cessna 172).",
+                "description": (
+                    "Which aircraft to plan for. If the user did not name one, "
+                    "use c172 (Cessna 172), the default trainer."
+                ),
+                "enum": sorted(AIRCRAFT),
                 "required": False,
             },
             "use_wind": {
