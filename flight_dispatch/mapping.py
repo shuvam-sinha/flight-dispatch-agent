@@ -33,7 +33,54 @@ AIRPORT_COLOR = "#d62728"  # origin and destination
 NAVAID_COLOR = "#0066cc"  # intermediate beacons
 
 
-def route_map(plan: "RoutePlan", zoom_padding: float = 0.15):
+AIRSPACE_COLORS = {
+    "P": "#8b0000",   # prohibited -- darkest, never enter
+    "R": "#d62728",   # restricted
+    "W": "#ff7f0e",   # warning
+    "MOA": "#9467bd",  # advisory only
+    "A": "#8c564b",
+    "D": "#e377c2",
+}
+
+
+def add_airspace(route_map_obj, volumes, folium=None) -> None:
+    """Overlay special-use airspace polygons on a map.
+
+    This is what makes the avoidance behaviour legible: without the
+    polygons drawn, a route bending around a restricted area just looks
+    like an inefficient route.
+    """
+    if folium is None:
+        import folium
+
+    for volume in volumes:
+        geometry = volume.geometry
+        # A polygon may have holes; only the outer ring is drawn, which is
+        # conservative for display purposes.
+        try:
+            rings = [geometry.exterior]
+        except AttributeError:  # MultiPolygon
+            rings = [part.exterior for part in geometry.geoms]
+
+        color = AIRSPACE_COLORS.get(volume.type_code, "#666666")
+
+        for ring in rings:
+            folium.Polygon(
+                # shapely stores (lon, lat); folium wants (lat, lon). The
+                # FAA polygons carry a third z ordinate, hence the slice.
+                locations=[
+                    (point[1], point[0]) for point in ring.coords
+                ],
+                color=color,
+                weight=1.5,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.18,
+                tooltip=volume.describe(),
+            ).add_to(route_map_obj)
+
+
+def route_map(plan: "RoutePlan", airspace=None, zoom_padding: float = 0.15):
     """Build a folium Map showing a route plan.
 
     Two lines are drawn deliberately:
@@ -61,6 +108,10 @@ def route_map(plan: "RoutePlan", zoom_padding: float = 0.15):
     lons = [wp.lon for wp in plan.waypoints]
 
     route_map_obj = folium.Map(tiles="CartoDB positron", control_scale=True)
+
+    # Drawn first so the route line renders on top of the polygons.
+    if airspace:
+        add_airspace(route_map_obj, airspace, folium)
 
     # Great-circle reference course, origin straight to destination.
     folium.PolyLine(
@@ -157,7 +208,7 @@ def _add_waypoint_markers(folium, route_map_obj, plan: "RoutePlan") -> None:
         ).add_to(route_map_obj)
 
 
-def save_route_map(plan: "RoutePlan", path: str) -> str:
+def save_route_map(plan: "RoutePlan", path: str, airspace=None) -> str:
     """Render a route to an HTML file and return the path written.
 
     Creates the parent directory if needed, so `--map maps/foo.html`
@@ -167,5 +218,5 @@ def save_route_map(plan: "RoutePlan", path: str) -> str:
     if destination.parent != Path(""):
         destination.parent.mkdir(parents=True, exist_ok=True)
 
-    route_map(plan).save(str(destination))
+    route_map(plan, airspace=airspace).save(str(destination))
     return str(destination)

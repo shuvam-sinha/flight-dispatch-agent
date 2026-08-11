@@ -15,7 +15,23 @@ import requests
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 BASE_URL = "https://davidmegginson.github.io/ourairports-data"
 
-FILES = ("airports.csv", "navaids.csv", "runways.csv")
+# FAA special-use airspace: restricted areas, prohibited areas, MOAs and
+# warning areas, as GeoJSON polygons. Published by the FAA's Aeronautical
+# Information Services on their ArcGIS open-data portal.
+#
+# US-only, unlike the OurAirports data, so airspace avoidance only applies
+# to domestic routes. That is noted in the README's limitations section.
+AIRSPACE_URL = (
+    "https://ais-faa.opendata.arcgis.com/datasets/"
+    "faa::special-use-airspace.geojson"
+)
+
+FILES = {
+    "airports.csv": f"{BASE_URL}/airports.csv",
+    "navaids.csv": f"{BASE_URL}/navaids.csv",
+    "runways.csv": f"{BASE_URL}/runways.csv",
+    "special_use_airspace.geojson": AIRSPACE_URL,
+}
 
 
 def download(filename: str, force: bool = False) -> None:
@@ -24,8 +40,10 @@ def download(filename: str, force: bool = False) -> None:
         print(f"  {filename}: already present, skipping (--force to refresh)")
         return
 
-    url = f"{BASE_URL}/{filename}"
-    response = requests.get(url, timeout=60)
+    url = FILES[filename]
+    # The FAA portal rejects requests without a browser-like User-Agent.
+    headers = {"User-Agent": "flight-dispatch-agent/1.0 (educational project)"}
+    response = requests.get(url, timeout=120, headers=headers, allow_redirects=True)
     response.raise_for_status()
 
     # Write via a temp file so an interrupted download can't leave a
@@ -34,8 +52,8 @@ def download(filename: str, force: bool = False) -> None:
     temp.write_bytes(response.content)
     temp.replace(destination)
 
-    kib = len(response.content) / 1024
-    print(f"  {filename}: {kib:,.0f} KiB")
+    size_mb = len(response.content) / 1024 / 1024
+    print(f"  {filename}: {size_mb:,.1f} MB")
 
 
 def main(argv=None) -> int:
@@ -46,7 +64,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading OurAirports data into {DATA_DIR}")
+    print(f"Downloading reference data into {DATA_DIR}")
 
     for filename in FILES:
         try:

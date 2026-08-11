@@ -21,7 +21,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 from .aircraft import AircraftProfile
-from .cost import make_time_heuristic, make_wind_cost, max_wind_speed_kt
+from .airspace import AirspaceIndex, make_airspace_cost
+from .cost import leg_time_hours, make_time_heuristic, make_wind_cost, max_wind_speed_kt
 from .geo import cross_and_along_track_nm, haversine_nm
 from .graph import DEFAULT_MIN_NEIGHBORS, DEFAULT_RADIUS_NM, WaypointGraph, build_mesh
 from .models import Airport, Navaid, Waypoint
@@ -56,6 +57,11 @@ class RoutePlan:
     # a distance-only route has no meaningful time or fuel figure.
     aircraft: Optional[AircraftProfile] = None
     ete_hours: Optional[float] = None
+
+    # Volumes that were active at cruise altitude near this route and had
+    # to be routed around. Empty when airspace was checked and none
+    # applied; None when airspace was not checked at all.
+    airspace_avoided: Optional[int] = None
 
     @property
     def fuel_required_gal(self) -> Optional[float]:
@@ -192,6 +198,7 @@ def plan_route(
     aircraft: Optional[AircraftProfile] = None,
     wind_source: Optional[WindSource] = None,
     altitude_ft: Optional[float] = None,
+    airspace: Optional["AirspaceIndex"] = None,
 ) -> RoutePlan:
     """CP2 routing: shortest path over a waypoint mesh graph.
 
@@ -252,6 +259,15 @@ def plan_route(
         strongest_kt = max_wind_speed_kt(wind_source, node_points, altitude)
         distance_to_cost = make_time_heuristic(aircraft, strongest_kt)
 
+    airspace_avoided = None if airspace is None else len(airspace)
+
+    if airspace is not None:
+        # Layered on top of the wind cost rather than replacing it, so the
+        # result is the fastest route that is also legal. An edge crossing
+        # prohibited or restricted airspace costs infinity, and A* routes
+        # around it for the same reason it avoids anything expensive.
+        cost_function = make_airspace_cost(airspace, cost_function)
+
     # Origin is at index 0 and destination last, by construction above.
     result = a_star(
         graph,
@@ -267,10 +283,21 @@ def plan_route(
             f"{graph.node_count} waypoints. Try a larger --radius-nm."
         )
 
-    if wind_source is not None:
+    if wind_source is not None and airspace is None:
         # With a time-based cost, the search's own total IS the flight
         # time -- no need to recompute it leg by leg.
         total_hours = result.cost
+    elif wind_source is not None:
+        # The airspace wrapper may have inflated costs, so recompute the
+        # time honestly from the chosen waypoints.
+        total_hours = sum(
+            leg_time_hours(a.lat, a.lon, b.lat, b.lon, aircraft, wind_source,
+                           aircraft.cruise_altitude_ft if altitude_ft is None else altitude_ft)
+            for a, b in zip(
+                [graph.nodes[i] for i in result.path],
+                [graph.nodes[i] for i in result.path][1:],
+            )
+        )
 
     return RoutePlan(
         origin=origin,
@@ -281,6 +308,7 @@ def plan_route(
         nodes_expanded=result.nodes_expanded,
         aircraft=aircraft,
         ete_hours=total_hours,
+        airspace_avoided=airspace_avoided,
     )
 
 

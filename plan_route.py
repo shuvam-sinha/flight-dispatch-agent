@@ -104,6 +104,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Cruise altitude in feet (default: the aircraft's own)",
     )
     parser.add_argument(
+        "--avoid-airspace",
+        action="store_true",
+        help="Route around FAA prohibited/restricted/warning areas",
+    )
+    parser.add_argument(
         "--map",
         metavar="PATH",
         nargs="?",
@@ -219,6 +224,12 @@ def format_plan(plan: RoutePlan) -> str:
                 f"WARNING:         exceeds endurance of "
                 f"{plan.aircraft.endurance_hours():.1f} h -- a fuel stop is required"
             )
+
+    if plan.airspace_avoided is not None:
+        lines.append(
+            f"Airspace:        avoided {plan.airspace_avoided} active "
+            f"prohibited/restricted/warning volumes"
+        )
 
     # Search diagnostics, present only for A* routes. Worth surfacing:
     # nodes_expanded vs graph size is the visible payoff of the heuristic.
@@ -358,6 +369,27 @@ def main(argv=None) -> int:
     # Cheap geographic prefilter before the expensive corridor test.
     wind_source = build_wind_source(args.wind)
 
+    airspace_index = None
+    if args.avoid_airspace:
+        from flight_dispatch.airspace import (
+            AirspaceDataError,
+            AirspaceIndex,
+            airspace_near_route,
+            load_airspace,
+        )
+
+        altitude = args.altitude or aircraft.cruise_altitude_ft
+        try:
+            volumes = load_airspace()
+        except AirspaceDataError as exc:
+            raise SystemExit(str(exc))
+        # Prefilter to the region, then to the cruise altitude: a
+        # restricted area topping out below the aircraft cannot affect it.
+        airspace_index = AirspaceIndex(
+            airspace_near_route(volumes, origin.lat, origin.lon, dest.lat, dest.lon),
+            altitude_ft=altitude,
+        )
+
     nearby = navaids_near_route(
         navaids,
         origin.lat,
@@ -385,6 +417,7 @@ def main(argv=None) -> int:
                 aircraft=aircraft,
                 wind_source=wind_source,
                 altitude_ft=args.altitude,
+                airspace=airspace_index,
             )
         except NoRouteFound as exc:
             raise SystemExit(str(exc))
@@ -398,7 +431,11 @@ def main(argv=None) -> int:
     if args.map:
         from flight_dispatch.mapping import save_route_map
 
-        written = save_route_map(plan, args.map)
+        written = save_route_map(
+            plan,
+            args.map,
+            airspace=airspace_index.volumes if airspace_index else None,
+        )
         print(f"\nMap written to {written}")
 
     return 0  # exit status 0 = success
