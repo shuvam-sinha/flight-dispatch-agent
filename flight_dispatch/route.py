@@ -20,10 +20,13 @@ and running A* over it, where a zigzag simply costs more and loses.
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+from .aircraft import AircraftProfile
+from .cost import make_time_heuristic, make_wind_cost, max_wind_speed_kt
 from .geo import cross_and_along_track_nm, haversine_nm
 from .graph import DEFAULT_MIN_NEIGHBORS, DEFAULT_RADIUS_NM, WaypointGraph, build_mesh
 from .models import Airport, Navaid, Waypoint
 from .search import a_star
+from .wind import WindSource
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,40 @@ class RoutePlan:
     graph_nodes: Optional[int] = None
     graph_edges: Optional[int] = None
     nodes_expanded: Optional[int] = None
+
+    # CP3. Present only when the route was planned against a wind source;
+    # a distance-only route has no meaningful time or fuel figure.
+    aircraft: Optional[AircraftProfile] = None
+    ete_hours: Optional[float] = None
+
+    @property
+    def fuel_required_gal(self) -> Optional[float]:
+        """Fuel for the planned time, including reserve."""
+        if self.aircraft is None or self.ete_hours is None:
+            return None
+        return self.aircraft.fuel_required_gal(self.ete_hours)
+
+    @property
+    def average_ground_speed_kt(self) -> Optional[float]:
+        """Distance flown divided by time taken.
+
+        Comparing this against the aircraft's cruise TAS shows at a glance
+        whether the flight was helped or hindered overall: above TAS means
+        a net tailwind, below means a net headwind.
+        """
+        if self.ete_hours is None or self.ete_hours == 0:
+            return None
+        return self.total_distance_nm / self.ete_hours
+
+    def is_within_range(self, payload_lb: Optional[float] = None) -> Optional[bool]:
+        """Whether the aircraft can actually make this flight.
+
+        A route can be geometrically fine and still unflyable -- that is
+        what an alternate or a fuel stop is for.
+        """
+        if self.aircraft is None or self.ete_hours is None:
+            return None
+        return self.ete_hours <= self.aircraft.endurance_hours(payload_lb)
 
     @property
     def direct_distance_nm(self) -> float:
@@ -152,6 +189,9 @@ def plan_route(
     navaids: Sequence[Navaid],
     radius_nm: float = DEFAULT_RADIUS_NM,
     min_neighbors: int = DEFAULT_MIN_NEIGHBORS,
+    aircraft: Optional[AircraftProfile] = None,
+    wind_source: Optional[WindSource] = None,
+    altitude_ft: Optional[float] = None,
 ) -> RoutePlan:
     """CP2 routing: shortest path over a waypoint mesh graph.
 
@@ -186,14 +226,51 @@ def plan_route(
         min_neighbors=min_neighbors,
     )
 
+    cost_function = None
+    distance_to_cost = None
+    total_hours: Optional[float] = None
+
+    if wind_source is not None:
+        if aircraft is None:
+            raise ValueError("wind_source requires an aircraft profile")
+
+        altitude = aircraft.cruise_altitude_ft if altitude_ft is None else altitude_ft
+
+        # Warm the wind cache for every node before A* starts, so the cost
+        # function below never issues a network request from inside the
+        # search loop. See wind_openmeteo for how this collapses tens of
+        # thousands of edge lookups into a handful of HTTP calls.
+        node_points = [(node.lat, node.lon) for node in graph.nodes]
+        if hasattr(wind_source, "prefetch"):
+            wind_source.prefetch(node_points, altitude)
+
+        cost_function = make_wind_cost(aircraft, wind_source, altitude)
+
+        # Cost is now hours, not miles, so the heuristic must convert. The
+        # bound uses the strongest wind anywhere in the graph as a
+        # best-case tailwind, which keeps it admissible.
+        strongest_kt = max_wind_speed_kt(wind_source, node_points, altitude)
+        distance_to_cost = make_time_heuristic(aircraft, strongest_kt)
+
     # Origin is at index 0 and destination last, by construction above.
-    result = a_star(graph, 0, graph.node_count - 1)
+    result = a_star(
+        graph,
+        0,
+        graph.node_count - 1,
+        cost_function=cost_function,
+        distance_to_cost=distance_to_cost,
+    )
 
     if not result.found:
         raise NoRouteFound(
             f"No path from {origin.icao} to {dest.icao} through "
             f"{graph.node_count} waypoints. Try a larger --radius-nm."
         )
+
+    if wind_source is not None:
+        # With a time-based cost, the search's own total IS the flight
+        # time -- no need to recompute it leg by leg.
+        total_hours = result.cost
 
     return RoutePlan(
         origin=origin,
@@ -202,6 +279,8 @@ def plan_route(
         graph_nodes=graph.node_count,
         graph_edges=graph.edge_count,
         nodes_expanded=result.nodes_expanded,
+        aircraft=aircraft,
+        ete_hours=total_hours,
     )
 
 

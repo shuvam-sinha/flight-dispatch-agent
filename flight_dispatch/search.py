@@ -74,6 +74,7 @@ def a_star(
     goal: int,
     cost_function: Optional[CostFunction] = None,
     heuristic_weight: float = 1.0,
+    distance_to_cost: Optional[Callable[[float], float]] = None,
 ) -> SearchResult:
     """Find the cheapest path from `start` to `goal`.
 
@@ -90,6 +91,15 @@ def a_star(
             optimal result. Above 1.0 makes the search greedier and
             faster but abandons the optimality guarantee -- exposed for
             experimentation, not for production use.
+        distance_to_cost: Converts remaining great-circle distance into
+            the same units `cost_function` returns. Required whenever
+            cost is not distance, and it MUST return a lower bound.
+
+            When cost is time, straight-line distance in nautical miles
+            is not comparable to hours, so passing nothing here would
+            silently break optimality -- the search would still return a
+            route, just not necessarily the cheapest. See
+            `cost.make_time_heuristic`.
 
     Returns:
         A SearchResult. Check `.found` -- a graph can be disconnected.
@@ -100,10 +110,22 @@ def a_star(
     goal_node = graph.nodes[goal]
 
     def heuristic(index: int) -> float:
-        """Straight-line distance from a node to the goal. Never an
-        overestimate, which is what keeps the result optimal."""
+        """Lower bound on the remaining cost from a node to the goal.
+
+        Straight-line distance is the shortest possible route, so
+        converting it with a function that assumes best-case conditions
+        can never overestimate -- which is the admissibility condition
+        that keeps A* optimal.
+        """
         node = graph.nodes[index]
-        return haversine_nm(node.lat, node.lon, goal_node.lat, goal_node.lon)
+        remaining_nm = haversine_nm(
+            node.lat, node.lon, goal_node.lat, goal_node.lon
+        )
+        return (
+            remaining_nm
+            if distance_to_cost is None
+            else distance_to_cost(remaining_nm)
+        )
 
     # g_score[n] = best known actual cost from start to n.
     g_score: Dict[int, float] = {start: 0.0}

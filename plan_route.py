@@ -10,6 +10,7 @@ agent can call the same functions without dragging along any CLI code.
 
 import argparse
 import sys
+from typing import Optional
 
 from flight_dispatch.data_loader import (
     MissingDataError,
@@ -28,6 +29,7 @@ from flight_dispatch.geo import haversine_nm, initial_bearing_deg
 from flight_dispatch.graph import DEFAULT_RADIUS_NM
 from flight_dispatch.models import Airport
 from flight_dispatch.route import NoRouteFound, RoutePlan, naive_route, plan_route
+from flight_dispatch.wind import ConstantWindSource
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -87,6 +89,19 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=int,
         default=5,
         help="CP1 only: maximum intermediate waypoints (default: 5)",
+    )
+    parser.add_argument(
+        "--wind",
+        nargs="?",
+        const="live",
+        metavar="SPEC",
+        help='Wind-aware routing: "live" for Open-Meteo, or "DDD/SS" for a '
+             'constant wind (e.g. 270/40 = 40 kt from the west)',
+    )
+    parser.add_argument(
+        "--altitude",
+        type=float,
+        help="Cruise altitude in feet (default: the aircraft's own)",
     )
     parser.add_argument(
         "--map",
@@ -177,6 +192,34 @@ def format_plan(plan: RoutePlan) -> str:
         f"({efficiency:.1f}% of direct)",
     ]
 
+    # CP3 figures, present only when the route was planned against wind.
+    if plan.ete_hours is not None and plan.aircraft is not None:
+        hours = int(plan.ete_hours)
+        minutes = int(round((plan.ete_hours - hours) * 60))
+        ground_speed = plan.average_ground_speed_kt or 0.0
+
+        # Average ground speed against cruise TAS says at a glance whether
+        # the flight was helped or hindered overall.
+        delta = ground_speed - plan.aircraft.cruise_tas_kt
+        wind_note = (
+            f"net tailwind {delta:+.0f} kt"
+            if delta >= 0
+            else f"net headwind {-delta:.0f} kt"
+        )
+
+        lines += [
+            f"ETE:             {hours}h{minutes:02d}m "
+            f"(avg {ground_speed:.0f} kt GS, {wind_note})",
+            f"Fuel required:   {plan.fuel_required_gal:.1f} gal "
+            f"(incl. {plan.aircraft.reserve_minutes:.0f} min reserve)",
+        ]
+
+        if plan.is_within_range() is False:
+            lines.append(
+                f"WARNING:         exceeds endurance of "
+                f"{plan.aircraft.endurance_hours():.1f} h -- a fuel stop is required"
+            )
+
     # Search diagnostics, present only for A* routes. Worth surfacing:
     # nodes_expanded vs graph size is the visible payoff of the heuristic.
     if plan.graph_nodes is not None:
@@ -239,6 +282,37 @@ def format_aircraft_summary(
     )
 
 
+def build_wind_source(spec: Optional[str]):
+    """Turn a --wind argument into a WindSource.
+
+    Accepts "live" for real Open-Meteo forecasts, or "DDD/SS" for a
+    uniform wind -- 270/40 meaning 40 kt blowing from the west. The
+    constant form is useful for demonstrating the routing effect in
+    isolation, since any bend in the route must then come from geometry
+    rather than from a complicated wind field.
+
+    Returns None when no wind was requested, which keeps the router on
+    CP2's distance-only cost.
+    """
+    if spec is None:
+        return None
+
+    if spec == "live":
+        # Imported lazily so the router works without `requests` when no
+        # live data is asked for.
+        from flight_dispatch.wind_openmeteo import OpenMeteoWindSource
+
+        return OpenMeteoWindSource()
+
+    try:
+        direction, speed = spec.split("/")
+        return ConstantWindSource(float(direction), float(speed))
+    except ValueError:
+        raise SystemExit(
+            f"Bad --wind value {spec!r}. Use 'live' or 'DDD/SS', e.g. 270/40."
+        )
+
+
 def main(argv=None) -> int:
     """Wire the pieces together: load -> look up -> filter -> route -> print."""
     args = parse_args(argv)
@@ -282,6 +356,8 @@ def main(argv=None) -> int:
     dest = lookup_airport(airports, args.dest, "destination")
 
     # Cheap geographic prefilter before the expensive corridor test.
+    wind_source = build_wind_source(args.wind)
+
     nearby = navaids_near_route(
         navaids,
         origin.lat,
@@ -301,7 +377,15 @@ def main(argv=None) -> int:
         )
     else:
         try:
-            plan = plan_route(origin, dest, nearby, radius_nm=args.radius_nm)
+            plan = plan_route(
+                origin,
+                dest,
+                nearby,
+                radius_nm=args.radius_nm,
+                aircraft=aircraft,
+                wind_source=wind_source,
+                altitude_ft=args.altitude,
+            )
         except NoRouteFound as exc:
             raise SystemExit(str(exc))
 
