@@ -129,17 +129,35 @@ class TestListAircraft(unittest.TestCase):
         self.assertGreater(result["count"], 40)
 
     def test_category_filter(self):
+        from flight_dispatch.aircraft import AIRCRAFT
+
         result = dispatch("list_aircraft", {"category": "widebody"})
-        self.assertTrue(all(a["category"] == "widebody" for a in result["aircraft"]))
+        widebody_keys = {k for k, p in AIRCRAFT.items() if p.category == "widebody"}
+        listed = {line.split(":")[0] for line in result["aircraft"]}
+        self.assertEqual(listed, widebody_keys)
 
     def test_bad_category_lists_the_valid_ones(self):
         result = dispatch("list_aircraft", {"category": "spaceship"})
         self.assertIn("valid_categories", result)
 
-    def test_entries_carry_what_a_model_needs_to_choose(self):
+    def test_entries_are_compact_lines_not_dicts(self):
+        # Structured entries cost 1,853 tokens unfiltered -- 45% of the
+        # on-device model's whole context. One line each carries the same
+        # information at a fraction of the size.
         entry = dispatch("list_aircraft", {"category": "ga"})["aircraft"][0]
-        for field in ("key", "name", "cruise_speed_kt", "range_nm", "seats"):
-            self.assertIn(field, entry)
+        self.assertIsInstance(entry, str)
+        self.assertTrue(entry.startswith("c172:"))
+        for fragment in ("Cessna", "kt", "seats", "nm"):
+            self.assertIn(fragment, entry)
+
+    def test_result_stays_within_a_sane_token_budget(self):
+        import json
+
+        size = len(json.dumps(dispatch("list_aircraft", {})))
+        self.assertLess(size // 4, 900, "list_aircraft result grew past its budget")
+
+    def test_format_line_explains_the_layout(self):
+        self.assertIn("key", dispatch("list_aircraft", {})["format"])
 
 
 class TestPlanFlight(unittest.TestCase):
