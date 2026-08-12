@@ -596,9 +596,18 @@ TOOLS: List[ToolSpec] = [
             # optionality -- see backend_apple._is_exposed.
             "aircraft": {
                 "type": "string",
+                # The enum supplies keys but not names, so a model cannot
+                # map "a Cirrus" to sr22 from the key list alone -- it
+                # planned a Cessna for exactly that request until these
+                # examples were added. Naming the common types here is far
+                # cheaper than making the model call list_aircraft first.
                 "description": (
-                    "Which aircraft to plan for. If the user did not name one, "
-                    "use c172 (Cessna 172), the default trainer."
+                    "Which aircraft to plan for. Common keys: c172 (Cessna 172), "
+                    "sr22 (Cirrus SR22), b350 (King Air), cj2 (Citation), "
+                    "e175 (Embraer E175), a320n (Airbus A320neo), "
+                    "b738 (Boeing 737-800), b789 (Boeing 787-9), "
+                    "b77w (Boeing 777-300ER), a388 (Airbus A380). "
+                    "If the user did not name an aircraft, use c172."
                 ),
                 "enum": sorted(AIRCRAFT),
                 "required": False,
