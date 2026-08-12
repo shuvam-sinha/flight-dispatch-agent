@@ -24,6 +24,7 @@ The underlying model resolution is coarser than the snap grid anyway
 information.
 """
 
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -37,10 +38,18 @@ API_URL = "https://api.open-meteo.com/v1/forecast"
 # vary meaningfully, and coarser than the model's own grid.
 DEFAULT_SNAP_DEG = 0.5
 
-# Open-Meteo caps URL length; batch coordinates in chunks well under it.
-MAX_POINTS_PER_REQUEST = 100
+# Coordinates per request. 100 produced a ~2,000-character URL and drew
+# 429s from Open-Meteo on larger meshes; 50 keeps URLs manageable and the
+# request rate below the free tier's limit without doubling the useful
+# work, since snapping already collapses most points.
+MAX_POINTS_PER_REQUEST = 50
 
 REQUEST_TIMEOUT_S = 30
+
+# A burst of batched requests can trip the free tier's rate limit. Retry
+# with backoff rather than failing the whole flight plan over it.
+MAX_RETRIES = 3
+RETRY_BACKOFF_S = 2.0
 
 
 class WindDataError(RuntimeError):
@@ -81,6 +90,7 @@ class OpenMeteoWindSource:
         self.cache_hits = 0
         self.points_fetched = 0
         self.degraded = False  # True if any fetch failed and we fell back
+        self.rate_limit_hits = 0
 
     # -- public interface ------------------------------------------------
 
@@ -151,20 +161,8 @@ class OpenMeteoWindSource:
             "forecast_days": 2,
         }
 
-        try:
-            response = self.session.get(
-                API_URL, params=params, timeout=REQUEST_TIMEOUT_S
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except (requests.RequestException, ValueError) as exc:
-            if not self.offline_ok:
-                raise WindDataError(
-                    f"Could not fetch winds from Open-Meteo: {exc}"
-                ) from exc
-            # Degraded mode: leave the cache empty so lookups fall back to
-            # calm air, and record that the data is not real.
-            self.degraded = True
+        payload = self._get_with_retry(params)
+        if payload is None:
             return
 
         self.requests_made += 1
@@ -178,6 +176,62 @@ class OpenMeteoWindSource:
             if wind is not None:
                 self._cache[(lat, lon, level)] = wind
                 self.points_fetched += 1
+
+    def _get_with_retry(self, params: dict) -> Optional[dict]:
+        """Fetch one batch, retrying rate limits with backoff.
+
+        A mesh of a thousand nodes issues twenty-odd batched requests in
+        quick succession, which the free tier answers with 429 Too Many
+        Requests. That is a transient condition, not a failure -- waiting
+        a moment and retrying gets the data, whereas propagating it loses
+        an entire flight plan over weather that was available two seconds
+        later.
+
+        Returns the parsed payload, or None when the caller has opted
+        into degraded mode and the fetch could not be completed.
+        """
+        last_error: Optional[Exception] = None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self.session.get(
+                    API_URL, params=params, timeout=REQUEST_TIMEOUT_S
+                )
+                if response.status_code == 429:
+                    last_error = requests.HTTPError("429 Too Many Requests")
+                    self.rate_limit_hits += 1
+                    if attempt < MAX_RETRIES - 1:
+                        # Honour Retry-After when the server supplies it,
+                        # otherwise back off exponentially.
+                        wait = float(
+                            response.headers.get(
+                                "Retry-After", RETRY_BACKOFF_S * (2**attempt)
+                            )
+                        )
+                        time.sleep(min(wait, 30.0))
+                        continue
+                    break
+
+                response.raise_for_status()
+                return response.json()
+
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_BACKOFF_S * (2**attempt))
+                    continue
+                break
+
+        if not self.offline_ok:
+            raise WindDataError(
+                f"Could not fetch winds from Open-Meteo after "
+                f"{MAX_RETRIES} attempts: {type(last_error).__name__}"
+            ) from last_error
+
+        # Degraded mode: leave the cache empty so lookups fall back to
+        # calm air, and record that the data is not real.
+        self.degraded = True
+        return None
 
     def _parse_entry(self, entry: dict, level: int) -> Optional[Wind]:
         """Turn one Open-Meteo response object into a Wind."""
@@ -213,6 +267,8 @@ class OpenMeteoWindSource:
     def stats(self) -> str:
         """One-line summary of fetch behaviour, for the CLI."""
         note = "  [DEGRADED: assuming calm air]" if self.degraded else ""
+        if self.rate_limit_hits:
+            note += f"  [{self.rate_limit_hits} rate-limit retries]"
         return (
             f"{self.points_fetched} grid points in {self.requests_made} "
             f"request(s), {self.cache_hits} cache hits{note}"

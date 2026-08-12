@@ -280,3 +280,67 @@ class TestCheckAirspace(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestErrorShortening(unittest.TestCase):
+    """Error text lands in the model's context, so its length is a cost.
+    A 429 from a batched wind request carried a 2,000-character URL --
+    ~500 tokens of a 4,096-token window, spent on a string the model can
+    do nothing with. It overflowed the conversation."""
+
+    def test_url_is_stripped(self):
+        from flight_dispatch.tools import _short_error
+
+        long_url = "https://api.open-meteo.com/v1/forecast?latitude=" + "41.0%2C" * 200
+        exc = RuntimeError(f"429 Client Error: Too Many Requests for url: {long_url}")
+        short = _short_error(exc)
+
+        self.assertNotIn("http", short)
+        self.assertIn("429", short)
+        self.assertLess(len(short), 100)
+
+    def test_long_messages_are_truncated(self):
+        from flight_dispatch.tools import MAX_ERROR_CHARS, _short_error
+
+        short = _short_error(ValueError("x" * 1000))
+        self.assertLessEqual(len(short), MAX_ERROR_CHARS + 40)
+
+    def test_short_messages_pass_through(self):
+        from flight_dispatch.tools import _short_error
+
+        self.assertIn("no such thing", _short_error(KeyError("no such thing")))
+
+    def test_type_name_is_kept(self):
+        from flight_dispatch.tools import _short_error
+
+        self.assertTrue(_short_error(TimeoutError("slow")).startswith("TimeoutError"))
+
+
+class TestMatchRanking(unittest.TestCase):
+    """Sorting purely by name length put a Mexican airstrip literally
+    named "San Francisco" ahead of San Francisco International, and the
+    agent planned a flight from it."""
+
+    def first_match(self, query):
+        return dispatch("find_airport", {"query": query})["matches"][0]["icao"]
+
+    def test_major_airports_rank_first(self):
+        self.assertEqual(self.first_match("San Francisco"), "KSFO")
+        self.assertEqual(self.first_match("Los Angeles"), "KLAX")
+        self.assertEqual(self.first_match("Minneapolis"), "KMSP")
+
+    def test_placeholder_identifiers_are_deprioritised(self):
+        # OurAirports uses MX-1385 / US-3912 style ids for fields with no
+        # real ICAO code. Those are almost never what a pilot means.
+        for query in ("San Francisco", "Los Angeles", "Minneapolis"):
+            with self.subTest(query):
+                self.assertNotIn("-", self.first_match(query))
+
+    def test_ranking_prefers_four_letter_icao_codes(self):
+        from flight_dispatch.tools import _match_rank
+        from flight_dispatch.models import Airport
+
+        real = Airport(icao="KSFO", name="San Francisco International Airport",
+                       lat=37.6, lon=-122.4)
+        placeholder = Airport(icao="MX-1385", name="San Francisco", lat=20.0, lon=-100.0)
+        self.assertLess(_match_rank(real), _match_rank(placeholder))

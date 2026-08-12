@@ -145,6 +145,37 @@ class ToolSpec:
 # ---------------------------------------------------------------------------
 
 
+def _match_rank(airport) -> tuple:
+    """Sort key for name-search results: most likely answer first.
+
+    THE BUG THIS REPLACES. Sorting purely by name length put a Mexican
+    airstrip named literally "San Francisco" (MX-1385) ahead of San
+    Francisco International, and the agent planned a flight from it.
+    Short is not the same as canonical.
+
+    Two signals do most of the work, both cheap:
+
+      A real ICAO code. Every major airport has a four-letter code
+      (KSFO, EGLL). Local identifiers like MX-1385 or US-3912 are
+      OurAirports' own placeholders for fields without one, and an
+      airport without an ICAO code is almost never the one a pilot
+      means.
+
+      The word "International". It is the strongest available hint of a
+      major airport in a dataset that carries no size or traffic figures.
+
+    Length remains the final tiebreaker, which is what it was always
+    suited for.
+    """
+    name = airport.name.lower()
+    has_icao = len(airport.icao) == 4 and airport.icao.isalpha()
+    return (
+        not has_icao,                 # real ICAO codes first
+        "international" not in name,  # then international airports
+        len(airport.name),            # then shortest name
+    )
+
+
 def find_airport(query: str) -> Dict[str, Any]:
     """Resolve a name or code to an ICAO identifier."""
     query = query.strip()
@@ -170,7 +201,7 @@ def find_airport(query: str) -> Dict[str, Any]:
         for airport in airports.values()
         if needle in airport.name.lower()
     ]
-    matches.sort(key=lambda a: len(a.name))
+    matches.sort(key=_match_rank)
 
     if not matches:
         return {
@@ -322,6 +353,7 @@ def plan_flight(
             airspace_index = None
             avoid_airspace = False
 
+    wind_note = None
     try:
         plan = plan_route(
             origin_airport,
@@ -334,6 +366,24 @@ def plan_flight(
         )
     except NoRouteFound as exc:
         return {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        # The wind service can fail mid-plan -- Open-Meteo rate-limits a
+        # burst of batched requests with a 429. Losing the whole flight
+        # plan over unavailable weather is the wrong trade: replan in
+        # still air and say so, rather than returning nothing.
+        if wind_source is None:
+            raise
+        wind_note = f"Winds unavailable ({_short_error(exc)}); planned in still air."
+        wind_source = None
+        use_wind = False
+        plan = plan_route(
+            origin_airport,
+            dest_airport,
+            navaids,
+            aircraft=profile,
+            altitude_ft=altitude,
+            airspace=airspace_index,
+        )
 
     result: Dict[str, Any] = {
         "origin": {"icao": origin_airport.icao, "name": origin_airport.name},
@@ -350,6 +400,9 @@ def plan_flight(
         "wind_applied": use_wind,
         "airspace_avoidance_applied": avoid_airspace,
     }
+
+    if wind_note:
+        result["wind_note"] = wind_note
 
     # The per-leg table is only included for routes short enough to be
     # worth reading. A transcontinental route has 21 waypoints, and the
@@ -719,4 +772,31 @@ def dispatch(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return tool.func(**arguments)
     except Exception as exc:  # noqa: BLE001 - deliberately broad; see docstring
-        return {"error": f"{name} failed: {type(exc).__name__}: {exc}"}
+        return {"error": f"{name} failed: {_short_error(exc)}"}
+
+
+# Error text goes straight into the model's context, so its length is a
+# cost. An HTTP failure from a batched request carries the full URL --
+# 100 comma-separated coordinate pairs, roughly 2,000 characters -- and
+# putting that in a tool result burned ~500 tokens of a 4,096-token
+# window on a string the model can do nothing with. It overflowed the
+# conversation and lost the turn.
+MAX_ERROR_CHARS = 180
+
+
+def _short_error(exc: Exception) -> str:
+    """One readable line describing a failure, with any URL stripped."""
+    text = str(exc)
+
+    # Cut anything from the first URL onward -- the useful part of an
+    # HTTP error is the status code, not the query string.
+    for marker in (" for url:", " url:", "https://", "http://"):
+        index = text.find(marker)
+        if index != -1:
+            text = text[:index].rstrip(" :")
+            break
+
+    if len(text) > MAX_ERROR_CHARS:
+        text = text[:MAX_ERROR_CHARS] + "..."
+
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
