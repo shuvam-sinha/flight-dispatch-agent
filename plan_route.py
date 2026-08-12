@@ -104,6 +104,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Cruise altitude in feet (default: the aircraft's own)",
     )
     parser.add_argument(
+        "--no-grid",
+        action="store_true",
+        help="Disable virtual oceanic waypoints (navaids only)",
+    )
+    parser.add_argument(
         "--avoid-airspace",
         action="store_true",
         help="Route around FAA prohibited/restricted/warning areas",
@@ -224,6 +229,12 @@ def format_plan(plan: RoutePlan) -> str:
                 f"WARNING:         exceeds endurance of "
                 f"{plan.aircraft.endurance_hours():.1f} h -- a fuel stop is required"
             )
+
+    if plan.grid_waypoints_used:
+        lines.append(
+            f"Oceanic fixes:   {plan.grid_waypoints_used} of "
+            f"{len(plan.waypoints)} waypoints are generated lat/lon points"
+        )
 
     if plan.airspace_avoided is not None:
         lines.append(
@@ -418,6 +429,7 @@ def main(argv=None) -> int:
                 wind_source=wind_source,
                 altitude_ft=args.altitude,
                 airspace=airspace_index,
+                use_grid=not args.no_grid,
             )
         except NoRouteFound as exc:
             raise SystemExit(str(exc))

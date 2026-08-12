@@ -328,6 +328,37 @@ def great_circle_point(
     )
 
 
+def destination_point(
+    lat: float, lon: float, bearing_deg: float, distance_nm: float
+) -> Tuple[float, float]:
+    """Where you end up flying `distance_nm` on `bearing_deg` from a point.
+
+    The inverse of `haversine_nm` + `initial_bearing_deg`: those measure
+    an existing pair of points, this projects a new one. Standard
+    direct-geodesic formula on a sphere.
+
+    Used to build the routing grid -- offsetting a point perpendicular to
+    the course requires exactly this, and there is no way to express it
+    with interpolation alone.
+    """
+    angular_distance = distance_nm / EARTH_RADIUS_NM
+    bearing = math.radians(bearing_deg)
+    phi1, lambda1 = math.radians(lat), math.radians(lon)
+
+    sin_phi2 = math.sin(phi1) * math.cos(angular_distance) + math.cos(
+        phi1
+    ) * math.sin(angular_distance) * math.cos(bearing)
+    phi2 = math.asin(_clamp(sin_phi2))
+
+    lambda2 = lambda1 + math.atan2(
+        math.sin(bearing) * math.sin(angular_distance) * math.cos(phi1),
+        math.cos(angular_distance) - math.sin(phi1) * sin_phi2,
+    )
+
+    # Normalise longitude back into [-180, 180].
+    return math.degrees(phi2), (math.degrees(lambda2) + 540) % 360 - 180
+
+
 def route_bounding_box(
     lat1: float,
     lon1: float,

@@ -412,6 +412,7 @@ def plan_flight(
             wind_source=wind_source,
             altitude_ft=altitude,
             airspace=airspace_index,
+            use_grid=True,
         )
     except NoRouteFound as exc:
         return {"error": str(exc)}
@@ -432,6 +433,7 @@ def plan_flight(
             aircraft=profile,
             altitude_ft=altitude,
             airspace=airspace_index,
+            use_grid=True,
         )
 
     result: Dict[str, Any] = {
@@ -471,6 +473,14 @@ def plan_flight(
 
     if plan.airspace_avoided is not None:
         result["restricted_volumes_considered"] = plan.airspace_avoided
+
+    if plan.grid_waypoints_used:
+        result["oceanic_waypoints"] = plan.grid_waypoints_used
+        result["waypoint_note"] = (
+            f"{plan.grid_waypoints_used} waypoints are lat/lon oceanic fixes "
+            "(named like 56N020W) rather than ground navaids, because navaids "
+            "are ground stations and do not cover open water."
+        )
 
     if save_map:
         # Imported lazily: folium is only needed when a map is asked for,

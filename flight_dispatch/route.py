@@ -25,6 +25,7 @@ from .airspace import AirspaceIndex, make_airspace_cost
 from .cost import leg_time_hours, make_time_heuristic, make_wind_cost, max_wind_speed_kt
 from .geo import cross_and_along_track_nm, haversine_nm
 from .graph import DEFAULT_MIN_NEIGHBORS, DEFAULT_RADIUS_NM, WaypointGraph, build_mesh
+from .grid import count_grid_points, waypoints_for_route
 from .models import Airport, Navaid, Waypoint
 from .search import a_star
 from .wind import WindSource
@@ -62,6 +63,10 @@ class RoutePlan:
     # to be routed around. Empty when airspace was checked and none
     # applied; None when airspace was not checked at all.
     airspace_avoided: Optional[int] = None
+
+    # How many waypoints on this route are generated lat/lon fixes rather
+    # than charted navaids. None when the grid was not used.
+    grid_waypoints_used: Optional[int] = None
 
     @property
     def fuel_required_gal(self) -> Optional[float]:
@@ -199,6 +204,7 @@ def plan_route(
     wind_source: Optional[WindSource] = None,
     altitude_ft: Optional[float] = None,
     airspace: Optional["AirspaceIndex"] = None,
+    use_grid: bool = False,
 ) -> RoutePlan:
     """CP2 routing: shortest path over a waypoint mesh graph.
 
@@ -224,11 +230,21 @@ def plan_route(
     Raises:
         NoRouteFound: if the mesh has no path between origin and dest.
     """
+    # Top up with virtual waypoints where navaids do not reach. Over land
+    # this adds almost nothing -- a real navaid is a better waypoint than
+    # a generated one, so the grid defers wherever coverage exists. Over
+    # water it supplies the only waypoints there are. See grid.py.
+    waypoints = list(navaids)
+    if use_grid:
+        waypoints = waypoints_for_route(
+            origin.lat, origin.lon, dest.lat, dest.lon, navaids
+        )
+
     # Origin and destination join the mesh as nodes so the path has
     # endpoints; no other airports participate, since real routes are
     # defined navaid-to-navaid.
     graph = build_mesh(
-        [origin, *navaids, dest],
+        [origin, *waypoints, dest],
         radius_nm=radius_nm,
         min_neighbors=min_neighbors,
     )
@@ -309,6 +325,11 @@ def plan_route(
         aircraft=aircraft,
         ete_hours=total_hours,
         airspace_avoided=airspace_avoided,
+        grid_waypoints_used=(
+            count_grid_points([graph.nodes[i] for i in result.path])
+            if use_grid
+            else None
+        ),
     )
 
 
