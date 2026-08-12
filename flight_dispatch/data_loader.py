@@ -37,6 +37,7 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 AIRPORTS_CSV = DATA_DIR / "airports.csv"
 NAVAIDS_CSV = DATA_DIR / "navaids.csv"
+RUNWAYS_CSV = DATA_DIR / "runways.csv"
 
 # Navaid types worth routing over.
 #
@@ -103,6 +104,10 @@ def load_airports(path: Path = AIRPORTS_CSV) -> Dict[str, Airport]:
             lat=lat,
             lon=lon,
             elevation_ft=_safe_float(row.get("elevation_ft")),
+            airport_type=(row.get("type") or "").strip(),
+            scheduled_service=(row.get("scheduled_service") or "").strip() == "yes",
+            iata_code=(row.get("iata_code") or "").strip(),
+            municipality=(row.get("municipality") or "").strip(),
         )
 
     return airports
@@ -150,6 +155,31 @@ def load_navaids(
         )
 
     return navaids
+
+
+def load_longest_runways(path: Path = RUNWAYS_CSV) -> Dict[str, int]:
+    """Longest runway per airport, in feet, keyed by ICAO code.
+
+    A size proxy for ranking name searches. OurAirports publishes no
+    passenger or movement figures, but runway length separates airports
+    that `type` and `scheduled_service` alone cannot: London Heathrow and
+    East London (South Africa) are both large airports with commercial
+    service, and their runways are 12,802 ft and roughly 6,200 ft.
+
+    Keyed on the same identifier `load_airports` uses, so the two join
+    directly. Airports with no runway row simply do not appear.
+    """
+    longest: Dict[str, int] = {}
+
+    for row in _read_rows(path):
+        icao = (row.get("airport_ident") or "").strip().upper()
+        length = _safe_float(row.get("length_ft"))
+        if not icao or length is None or length <= 0:
+            continue
+        if length > longest.get(icao, 0):
+            longest[icao] = int(length)
+
+    return longest
 
 
 def navaids_in_bounds(

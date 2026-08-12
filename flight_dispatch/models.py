@@ -57,6 +57,20 @@ class Airport:
     lon: float
     elevation_ft: Optional[float] = None
 
+    # Significance signals, used to rank name searches. OurAirports
+    # carries no size or traffic figures, but these four together
+    # separate a major airport from an airstrip that happens to share
+    # its name -- see tools._match_rank.
+    airport_type: str = ""        # large_airport / medium_airport / ...
+    scheduled_service: bool = False  # has commercial airline service
+    iata_code: str = ""           # SFO, LAX -- only commercial fields have one
+    municipality: str = ""        # the city, which is what users usually type
+
+    @property
+    def is_major(self) -> bool:
+        """A rough "would a passenger have heard of it" test."""
+        return self.airport_type == "large_airport" or self.scheduled_service
+
     @property
     def ident(self) -> str:
         """Uniform identifier across waypoint types.

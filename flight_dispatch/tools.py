@@ -52,6 +52,7 @@ from .airspace import (
 from .data_loader import (
     MissingDataError,
     load_airports,
+    load_longest_runways,
     load_navaids,
     navaids_near_route,
 )
@@ -86,6 +87,20 @@ def _navaids() -> list:
     if "navaids" not in _CACHE:
         _CACHE["navaids"] = load_navaids()
     return _CACHE["navaids"]
+
+
+def _runways() -> dict:
+    """Longest runway per airport, for ranking name searches.
+
+    Loaded lazily and tolerantly: ranking is a nicety, so a missing
+    runways.csv degrades the ordering rather than failing the lookup.
+    """
+    if "runways" not in _CACHE:
+        try:
+            _CACHE["runways"] = load_longest_runways()
+        except MissingDataError:
+            _CACHE["runways"] = {}
+    return _CACHE["runways"]
 
 
 def _airspace() -> list:
@@ -145,34 +160,60 @@ class ToolSpec:
 # ---------------------------------------------------------------------------
 
 
-def _match_rank(airport) -> tuple:
+# Airport types, most significant first. OurAirports publishes no size
+# or traffic figures, but this classification plus scheduled_service is a
+# good proxy for the one a pilot means.
+_TYPE_RANK = {
+    "large_airport": 0,
+    "medium_airport": 1,
+    "small_airport": 2,
+    "seaplane_base": 3,
+    "balloonport": 4,
+    "heliport": 5,
+    "closed": 6,
+}
+
+
+def _match_rank(airport, needle: str = "", runway_ft: int = 0) -> tuple:
     """Sort key for name-search results: most likely answer first.
 
-    THE BUG THIS REPLACES. Sorting purely by name length put a Mexican
-    airstrip named literally "San Francisco" (MX-1385) ahead of San
-    Francisco International, and the agent planned a flight from it.
-    Short is not the same as canonical.
+    THE BUG THIS REPLACES. Sorting by name length put a Mexican airstrip
+    named literally "San Francisco" (MX-1385) ahead of San Francisco
+    International, and the agent planned a flight from it. Short is not
+    the same as canonical, and neither is a guess at what the name
+    contains.
 
-    Two signals do most of the work, both cheap:
+    Four real signals, in priority order:
 
-      A real ICAO code. Every major airport has a four-letter code
-      (KSFO, EGLL). Local identifiers like MX-1385 or US-3912 are
-      OurAirports' own placeholders for fields without one, and an
-      airport without an ICAO code is almost never the one a pilot
-      means.
+      TYPE. large_airport (1,172 of 85,825) versus small_airport
+        (42,700). The single strongest discriminator in the dataset.
+      SCHEDULED SERVICE. 4,365 airports carry commercial airline
+        service. If a passenger could book a flight there, it is almost
+        certainly what they meant.
+      IATA CODE. 9,054 have one. Presence signals commercial relevance;
+        an airstrip does not get an IATA code.
+      MUNICIPALITY MATCH. Someone typing "San Francisco" usually means
+        the airport serving that city, not one that happens to share the
+        name -- so a municipality hit outranks a mere name hit.
+      LONGEST RUNWAY. The tiebreaker among airports the first four
+        cannot separate. London Heathrow and East London (South Africa)
+        are both large airports with scheduled service and IATA codes,
+        and "East London Airport" is the shorter name -- so name length
+        put a South African regional airport ahead of Heathrow. Their
+        runways are 12,802 ft and ~6,200 ft.
 
-      The word "International". It is the strongest available hint of a
-      major airport in a dataset that carries no size or traffic figures.
-
-    Length remains the final tiebreaker, which is what it was always
-    suited for.
+    Name length survives only as the final tiebreaker, which is all it
+    was ever suited for.
     """
-    name = airport.name.lower()
-    has_icao = len(airport.icao) == 4 and airport.icao.isalpha()
+    municipality_match = needle and needle in airport.municipality.lower()
+
     return (
-        not has_icao,                 # real ICAO codes first
-        "international" not in name,  # then international airports
-        len(airport.name),            # then shortest name
+        _TYPE_RANK.get(airport.airport_type, 7),  # large airports first
+        not airport.scheduled_service,            # then commercial service
+        not airport.iata_code,                    # then an IATA code
+        not municipality_match,                   # then serving that city
+        -runway_ft,                               # then the bigger airport
+        len(airport.name),                        # then shortest name
     )
 
 
@@ -193,15 +234,23 @@ def find_airport(query: str) -> Dict[str, Any]:
             "elevation_ft": exact.elevation_ft,
         }
 
-    # Otherwise search names. The model often has a city or airport name
-    # rather than a code -- "Chicago Executive", "Heathrow".
+    # Otherwise search names AND municipalities. The model usually has a
+    # city rather than an airport name -- someone asking for "London"
+    # means Heathrow, whose name is "London Heathrow Airport" but whose
+    # municipality is simply "London". Searching both catches airports
+    # named for their city and airports merely serving it.
     needle = query.lower()
     matches = [
         airport
         for airport in airports.values()
-        if needle in airport.name.lower()
+        if needle in airport.name.lower() or needle in airport.municipality.lower()
     ]
-    matches.sort(key=_match_rank)
+    runways = _runways()
+    matches.sort(
+        key=lambda airport: _match_rank(
+            airport, needle, runways.get(airport.icao, 0)
+        )
+    )
 
     if not matches:
         return {

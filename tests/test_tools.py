@@ -336,11 +336,58 @@ class TestMatchRanking(unittest.TestCase):
             with self.subTest(query):
                 self.assertNotIn("-", self.first_match(query))
 
-    def test_ranking_prefers_four_letter_icao_codes(self):
-        from flight_dispatch.tools import _match_rank
-        from flight_dispatch.models import Airport
+    def test_major_city_queries_resolve_to_the_primary_airport(self):
+        # Each of these previously returned the wrong airport, because
+        # ties among equally-major airports fell through to name length.
+        for query, expected in [
+            ("London", "EGLL"),       # was FAEL, East London, South Africa
+            ("Chicago", "KORD"),      # was KMDW, Midway
+            ("Paris", "LFPG"),        # was LFPO, Orly
+            ("New York", "KJFK"),     # was KLGA, LaGuardia
+            ("Tokyo", "RJTT"),
+        ]:
+            with self.subTest(query):
+                self.assertEqual(self.first_match(query), expected)
 
-        real = Airport(icao="KSFO", name="San Francisco International Airport",
-                       lat=37.6, lon=-122.4)
-        placeholder = Airport(icao="MX-1385", name="San Francisco", lat=20.0, lon=-100.0)
-        self.assertLess(_match_rank(real), _match_rank(placeholder))
+    def test_ranking_prefers_a_large_airport_over_an_airstrip(self):
+        from flight_dispatch.models import Airport
+        from flight_dispatch.tools import _match_rank
+
+        real = Airport(
+            icao="KSFO", name="San Francisco International Airport",
+            lat=37.6, lon=-122.4, airport_type="large_airport",
+            scheduled_service=True, iata_code="SFO", municipality="San Francisco",
+        )
+        airstrip = Airport(
+            icao="MX-1385", name="Pista San Francisco", lat=24.8, lon=-107.4,
+            airport_type="small_airport", municipality="Culiacan",
+        )
+        self.assertLess(_match_rank(real, "san francisco"),
+                        _match_rank(airstrip, "san francisco"))
+
+    def test_runway_length_breaks_ties_between_major_airports(self):
+        from flight_dispatch.models import Airport
+        from flight_dispatch.tools import _match_rank
+
+        # Both large, scheduled, IATA-coded, both match "london".
+        # Only runway length separates them -- and "East London Airport"
+        # is the shorter name, so length alone got this backwards.
+        heathrow = Airport(icao="EGLL", name="London Heathrow Airport",
+                           lat=51.5, lon=-0.5, airport_type="large_airport",
+                           scheduled_service=True, iata_code="LHR",
+                           municipality="London")
+        east_london = Airport(icao="FAEL", name="East London Airport",
+                              lat=-33.0, lon=27.8, airport_type="large_airport",
+                              scheduled_service=True, iata_code="ELS",
+                              municipality="East London")
+        self.assertLess(
+            _match_rank(heathrow, "london", runway_ft=12802),
+            _match_rank(east_london, "london", runway_ft=6200),
+        )
+
+    def test_municipality_is_searched_not_just_the_name(self):
+        # Heathrow's name contains "London", but many airports are named
+        # for something else entirely and only their municipality says
+        # which city they serve.
+        result = dispatch("find_airport", {"query": "Minneapolis"})
+        self.assertGreater(result["match_count"], 1)
