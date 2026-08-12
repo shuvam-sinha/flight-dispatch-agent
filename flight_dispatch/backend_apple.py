@@ -180,9 +180,15 @@ def _build_bridge_tool(tool: ToolSpec, backend: "AppleBackend"):
                 if value is not None:
                     supplied[arg_name] = value
 
-            backend.record_call(tool.name, supplied)
+            # Record the call and its result as one unit. Apple runs
+            # tools concurrently, so appending to two separate lists and
+            # zipping them later mispairs them whenever more than one
+            # call is in flight -- a "Minneapolis" lookup was displayed
+            # showing Chicago Executive's result.
+            call_id = backend.next_call_id()
+            backend.record_call(call_id, tool.name, supplied)
             result = dispatch(tool.name, supplied)
-            backend.record_result(tool.name, result)
+            backend.record_result(call_id, tool.name, result)
 
             # Apple's tools return a string. JSON keeps the structure
             # legible to the model without inventing a prose format.
@@ -323,18 +329,42 @@ class AppleBackend:
 
     # -- call recording, for the CLI --------------------------------------
 
-    def record_call(self, name: str, arguments: Dict[str, Any]) -> None:
+    def next_call_id(self) -> str:
+        """Allocate an id for one tool invocation.
+
+        Apple runs tools concurrently, so an id must be taken once per
+        call and carried through to its result. Deriving it from a shared
+        counter at result time instead pairs the wrong ones together.
+        """
         self._call_counter += 1
+        return f"afm_{self._call_counter}"
+
+    def record_call(
+        self, call_id: str, name: str, arguments: Dict[str, Any]
+    ) -> None:
         self.calls_this_turn.append(
-            ToolCall(id=f"afm_{self._call_counter}", name=name, arguments=arguments)
+            ToolCall(id=call_id, name=name, arguments=arguments)
         )
 
-    def record_result(self, name: str, content: Dict[str, Any]) -> None:
+    def record_result(
+        self, call_id: str, name: str, content: Dict[str, Any]
+    ) -> None:
         self.results_this_turn.append(
-            ToolResult(
-                call_id=f"afm_{self._call_counter}", name=name, content=content
-            )
+            ToolResult(call_id=call_id, name=name, content=content)
         )
+
+    def paired_calls(self):
+        """Calls with their results, matched by id rather than position.
+
+        Concurrent execution means the two lists can be in different
+        orders, so callers must not zip them.
+        """
+        by_id = {result.call_id: result for result in self.results_this_turn}
+        return [
+            (call, by_id.get(call.id))
+            for call in self.calls_this_turn
+            if call.id in by_id
+        ]
 
     def reset(self) -> None:
         """Start a fresh conversation, discarding history.

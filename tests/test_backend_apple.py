@@ -111,7 +111,7 @@ class TestBackendWiring(unittest.TestCase):
 
     def test_reset_clears_recorded_calls(self):
         self.backend.start("test", [TOOLS_BY_NAME["find_airport"]])
-        self.backend.record_call("find_airport", {"query": "KORD"})
+        self.backend.record_call("id1", "find_airport", {"query": "KORD"})
         self.assertEqual(len(self.backend.calls_this_turn), 1)
         self.backend.reset()
         self.assertEqual(self.backend.calls_this_turn, [])
@@ -142,6 +142,46 @@ class TestLiveModel(unittest.TestCase):
 
         result = backend.results_this_turn[0]
         self.assertEqual(result.content["icao"], "KORD")
+
+
+
+@unittest.skipUnless(SDK_AVAILABLE, "apple-fm-sdk not installed")
+class TestCallResultPairing(unittest.TestCase):
+    """Apple runs tools concurrently, so calls and results can be recorded
+    in different orders. Pairing by position mispaired them -- a
+    "Minneapolis" lookup was displayed showing Chicago Executive's
+    result. These pin the id-based pairing."""
+
+    def setUp(self):
+        if not MODEL_READY:
+            self.skipTest("model unavailable")
+        self.backend = AppleBackend()
+
+    def test_ids_are_unique_per_call(self):
+        ids = {self.backend.next_call_id() for _ in range(5)}
+        self.assertEqual(len(ids), 5)
+
+    def test_pairing_survives_out_of_order_results(self):
+        first = self.backend.next_call_id()
+        second = self.backend.next_call_id()
+
+        self.backend.record_call(first, "find_airport", {"query": "Minneapolis"})
+        self.backend.record_call(second, "find_airport", {"query": "Chicago Executive"})
+        # Results arrive in the opposite order, as concurrent tools can.
+        self.backend.record_result(second, "find_airport", {"icao": "KPWK"})
+        self.backend.record_result(first, "find_airport", {"match_count": 3})
+
+        pairs = dict(
+            (call.arguments["query"], result.content)
+            for call, result in self.backend.paired_calls()
+        )
+        self.assertEqual(pairs["Chicago Executive"]["icao"], "KPWK")
+        self.assertEqual(pairs["Minneapolis"]["match_count"], 3)
+
+    def test_unfinished_calls_are_omitted(self):
+        call_id = self.backend.next_call_id()
+        self.backend.record_call(call_id, "find_airport", {"query": "KORD"})
+        self.assertEqual(self.backend.paired_calls(), [])
 
 
 if __name__ == "__main__":

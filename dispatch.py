@@ -105,6 +105,27 @@ def choose_tools(all_tools: bool) -> List[ToolSpec]:
     return [TOOLS_BY_NAME[name] for name in LEAN_TOOL_NAMES]
 
 
+def paired_calls(turn, backend):
+    """Tool calls with their results, correctly matched.
+
+    Two sources, because the backends differ. A backend that drives the
+    hand-written loop puts calls and results on the Turn; Apple runs
+    tools itself and records them on the backend instead.
+
+    Never zip the two lists. Apple executes tools concurrently, so they
+    can be in different orders -- a "Minneapolis" lookup once displayed
+    Chicago Executive's result because of exactly that.
+    """
+    if turn.tool_calls:
+        by_id = {result.call_id: result for result in turn.tool_results}
+        return [
+            (call, by_id[call.id]) for call in turn.tool_calls if call.id in by_id
+        ]
+    if hasattr(backend, "paired_calls"):
+        return backend.paired_calls()
+    return []
+
+
 def format_arguments(call: ToolCall) -> str:
     """Render arguments compactly, hiding defaults the model filled in.
 
@@ -230,19 +251,13 @@ def run_session(agent: DispatcherAgent, backend, tools, show_tools: bool) -> int
             print(dim("\n  interrupted\n"))
             continue
 
-        # Apple's SDK runs tools internally, so the calls are recorded on
-        # the backend rather than surfaced through the loop. Prefer the
-        # loop's record when it has one, since that is where a
-        # loop-driving backend puts them.
-        calls = turn.tool_calls or getattr(backend, "calls_this_turn", [])
-        results = turn.tool_results or getattr(backend, "results_this_turn", [])
-
-        if show_tools and calls:
-            for call, result in zip(calls, results):
+        if show_tools:
+            for call, result in paired_calls(turn, backend):
                 arguments = format_arguments(call)
                 print(dim(f"  → {call.name}({arguments})"))
                 print(dim(f"    {summarise_result(result)}"))
-            print()
+            if turn.tool_calls or getattr(backend, "calls_this_turn", []):
+                print()
 
         print(turn.reply)
         print()
@@ -257,10 +272,11 @@ def main(argv=None) -> int:
 
     if args.ask:
         turn = agent.ask(args.ask)
-        calls = turn.tool_calls or getattr(backend, "calls_this_turn", [])
-        if not args.quiet and calls:
-            for call in calls:
+        pairs = paired_calls(turn, backend)
+        if not args.quiet and pairs:
+            for call, result in pairs:
                 print(dim(f"  → {call.name}({format_arguments(call)})"))
+                print(dim(f"    {summarise_result(result)}"))
             print()
         print(turn.reply)
         return 0
