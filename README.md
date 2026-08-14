@@ -101,7 +101,7 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
 
 ```bash
-python -m unittest discover tests      # 350 tests
+python -m unittest discover tests      # 353 tests
 ```
 
 ## Layout
@@ -281,6 +281,15 @@ paper over sloppy tool design. Two constraints followed from it:
 - **Tool results must be small.** `list_aircraft` originally returned 1,853
   tokens — 45% of the entire window for one call. Rewritten as one compact line
   per aircraft, it costs 737.
+- **Candidate lists are for choosing from, not for using.** Dumping a real
+  session's transcript showed one `find_airport("Chicago")` at 1,206 characters
+  — **41% of the entire conversation**, and the largest single thing in it. It
+  returned eight matches, each with latitude and longitude, and the model picked
+  one and carried the other seven for the rest of the conversation. Capping at
+  three and dropping the coordinates cut it to 247 characters, a 72% reduction.
+  Nothing downstream wanted those coordinates: `plan_flight` takes ICAO codes,
+  and `get_winds_aloft` gets a position by looking the chosen code up again for
+  36 tokens.
 - **Tool schemas must be small.** The five tools together crowd out the model's
   own reasoning, so `dispatch.py` exposes a lean three by default and
   `--all-tools` opts into the rest.
@@ -556,4 +565,4 @@ larger-context model drops in.
 - Oceanic routing measured before and after the grid on five routes, including
   two overland controls that must *not* change
 - The agent loop tested against a `ScriptedBackend` — no model, no network
-- **350 unit tests**
+- **353 unit tests**

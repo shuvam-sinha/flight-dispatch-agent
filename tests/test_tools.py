@@ -114,7 +114,27 @@ class TestFindAirport(unittest.TestCase):
 
     def test_matches_are_capped(self):
         result = dispatch("find_airport", {"query": "International"})
-        self.assertLessEqual(len(result["matches"]), 8)
+        self.assertLessEqual(len(result["matches"]), 3)
+
+    def test_candidates_carry_no_coordinates(self):
+        # A candidate list is for choosing from, not for using. Eight
+        # matches with lat/lon each made one "Chicago" lookup 41% of the
+        # whole transcript, and the model discards all but one of them.
+        # Coordinates come from looking the chosen code up.
+        result = dispatch("find_airport", {"query": "Chicago"})
+        self.assertNotIn("latitude", result["matches"][0])
+
+    def test_an_exact_code_still_returns_a_position(self):
+        # get_winds_aloft needs coordinates, and this is where they
+        # come from now.
+        result = dispatch("find_airport", {"query": "KORD"})
+        self.assertIn("latitude", result)
+        self.assertIn("longitude", result)
+
+    def test_true_match_count_survives_the_cap(self):
+        result = dispatch("find_airport", {"query": "Chicago"})
+        self.assertEqual(len(result["matches"]), 3)
+        self.assertGreater(result["match_count"], 3)
 
     def test_no_match_gives_a_hint(self):
         result = dispatch("find_airport", {"query": "zzzznotanairport"})

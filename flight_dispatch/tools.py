@@ -77,6 +77,11 @@ from .wind import ConstantWindSource
 # had computed correctly.
 MAX_DETAILED_WAYPOINTS = 12
 
+# Candidate airports returned by a name search. Was 8; a city lookup then
+# cost ~217 tokens against ~36 for an exact code, and seven of the eight
+# were discarded the moment the model chose one.
+MAX_AIRPORT_MATCHES = 3
+
 _CACHE: Dict[str, Any] = {}
 
 
@@ -390,16 +395,31 @@ def find_airport(query: str) -> Dict[str, Any]:
             "hint": "Try an ICAO code (KORD) or a fuller name.",
         }
 
+    # CANDIDATES ARE FOR CHOOSING, NOT FOR USING.
+    #
+    # This list used to carry eight matches with latitude and longitude
+    # on each. Measured in a real session, one `find_airport("Chicago")`
+    # was 1,206 characters -- 41% of the entire transcript, and the
+    # single largest thing in it. The model reads the list, picks one
+    # airport, and every other field sits in the context for the rest of
+    # the conversation doing nothing.
+    #
+    # Coordinates go because nothing downstream takes them from here:
+    # `plan_flight` wants ICAO codes. `get_winds_aloft` does want a
+    # position, and gets it by looking the chosen code up again -- an
+    # exact-code lookup returns the full record and costs about 36
+    # tokens, which is far cheaper than carrying eight positions on the
+    # chance one is needed.
+    #
+    # Three rather than eight because a fourth-ranked match is not a
+    # serious candidate. The ranker is good enough that if the answer is
+    # not in the top three, more rows will not rescue it -- and
+    # `match_count` still reports the true total.
     return {
         "found": True,
         "matches": [
-            {
-                "icao": airport.icao,
-                "name": airport.name,
-                "latitude": round(airport.lat, 4),
-                "longitude": round(airport.lon, 4),
-            }
-            for airport in matches[:8]
+            {"icao": airport.icao, "name": airport.name}
+            for airport in matches[:MAX_AIRPORT_MATCHES]
         ],
         "match_count": len(matches),
     }
@@ -879,7 +899,10 @@ TOOLS: List[ToolSpec] = [
             "Look up an airport by ICAO code, name, or city. Call this FIRST "
             "whenever the user names an airport in plain language rather than "
             "giving a four-letter ICAO code, so you route from the right "
-            "place. Returns matching airports with their codes and positions."
+            "place. A name or city returns the best few matches, best first. "
+            "An exact ICAO or IATA code returns that one airport with its "
+            "position -- so if you need coordinates for get_winds_aloft, look "
+            "up the code you chose."
         ),
         parameters={
             "query": {
