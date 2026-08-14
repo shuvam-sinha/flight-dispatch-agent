@@ -39,6 +39,7 @@ Three things matter more here than in ordinary API design:
      turn. Raising would end the conversation.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -205,7 +206,9 @@ def _match_rank(airport, needle: str = "", runway_ft: int = 0) -> tuple:
     Name length survives only as the final tiebreaker, which is all it
     was ever suited for.
     """
-    municipality_match = needle and needle in airport.municipality.lower()
+    # `needle` arrives normalised, so the municipality is normalised too
+    # -- otherwise "OHare" would never match the city text it came from.
+    municipality_match = needle and needle in _normalise(airport.municipality)
 
     return (
         _TYPE_RANK.get(airport.airport_type, 7),  # large airports first
@@ -217,34 +220,130 @@ def _match_rank(airport, needle: str = "", runway_ft: int = 0) -> tuple:
     )
 
 
+_SEARCH_INDEX: Optional[List] = None
+
+
+def _normalise(text: str) -> str:
+    """Lowercase and strip punctuation, so O'Hare matches OHare.
+
+    People type identifiers without their punctuation far more often than
+    with it, and no airport is distinguished from another by an
+    apostrophe. Both the query and the haystack go through this, so the
+    comparison is punctuation-blind on both sides.
+    """
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _search_index() -> List:
+    """Airports paired with their searchable text, built once.
+
+    Every name, city, IATA and ICAO code a person might use, normalised.
+    85,825 airports is enough that rebuilding this per query would show
+    up in a conversation's latency.
+    """
+    global _SEARCH_INDEX
+    if _SEARCH_INDEX is None:
+        _SEARCH_INDEX = [
+            (
+                airport,
+                _normalise(
+                    " ".join(
+                        (
+                            airport.name,
+                            airport.municipality,
+                            airport.iata_code,
+                            airport.icao,
+                        )
+                    )
+                ),
+            )
+            for airport in _airports().values()
+        ]
+    return _SEARCH_INDEX
+
+
 def find_airport(query: str) -> Dict[str, Any]:
     """Resolve a name or code to an ICAO identifier."""
     query = query.strip()
     airports = _airports()
 
+    def described(airport):
+        return {
+            "found": True,
+            "icao": airport.icao,
+            "name": airport.name,
+            "latitude": round(airport.lat, 4),
+            "longitude": round(airport.lon, 4),
+            "elevation_ft": airport.elevation_ft,
+        }
+
     # Exact ICAO match first -- the common case, and unambiguous.
     exact = airports.get(query.upper())
     if exact is not None:
-        return {
-            "found": True,
-            "icao": exact.icao,
-            "name": exact.name,
-            "latitude": round(exact.lat, 4),
-            "longitude": round(exact.lon, 4),
-            "elevation_ft": exact.elevation_ft,
-        }
+        return described(exact)
+
+    # Then an exact IATA code. "JFK" and "LAX" are what people actually
+    # say, and they are unambiguous, but they are not substrings of the
+    # airport's name -- so a text search would never find them.
+    if len(query) == 3 and query.isalpha():
+        by_iata = [a for a in airports.values() if a.iata_code.upper() == query.upper()]
+        if len(by_iata) == 1:
+            return described(by_iata[0])
 
     # Otherwise search names AND municipalities. The model usually has a
     # city rather than an airport name -- someone asking for "London"
     # means Heathrow, whose name is "London Heathrow Airport" but whose
     # municipality is simply "London". Searching both catches airports
     # named for their city and airports merely serving it.
-    needle = query.lower()
-    matches = [
-        airport
-        for airport in airports.values()
-        if needle in airport.name.lower() or needle in airport.municipality.lower()
-    ]
+    needle = _normalise(query)
+    index = _search_index()
+    matches = [airport for airport, text in index if needle in text]
+
+    # Widen to airports carrying every word somewhere in their
+    # searchable text. "New York JFK" is a substring of nothing: the city
+    # lives in one field and the code in another, so the phrase can only
+    # match once it is broken apart.
+    #
+    # This widens rather than falls back, because the phrase search can
+    # succeed on the wrong things: "Los Angeles airport" is literally
+    # contained in "Hilton Los Angeles Airport Helipad" but not in "Los
+    # Angeles International Airport", so stopping at the first non-empty
+    # result would hand back a hotel helipad. Both sets go to the ranker,
+    # which knows a large airport outranks a helipad.
+    tokens = needle.split()
+    if len(tokens) > 1:
+        seen = {airport.icao for airport in matches}
+        matches += [
+            airport
+            for airport, text in index
+            if airport.icao not in seen and all(token in text for token in tokens)
+        ]
+
+        # Still nothing: keep the airports matching the most tokens.
+        # "Sydney Australia" names a real airport, but no field holds the
+        # country, so requiring every word finds nothing at all. Best
+        # partial match degrades to "Sydney" on its own, and the ranker
+        # picks the significant one from there -- an unhelpful answer is
+        # still better than a dead end the model has to apologise for.
+        if not matches:
+            scored = [
+                (sum(1 for token in tokens if token in text), airport)
+                for airport, text in index
+            ]
+            best = max((score for score, _ in scored), default=0)
+            if best:
+                matches = [airport for score, airport in scored if score == best]
+
+    # Last resort: compare with all spacing removed, so "OHare" reaches
+    # "O'Hare". Normalising punctuation to a space handles "O Hare" but
+    # not the run-together form, and this pass only runs when everything
+    # else has failed, where a loose match beats no match.
+    if not matches:
+        squashed = needle.replace(" ", "")
+        matches = [
+            airport for airport, text in index if squashed in text.replace(" ", "")
+        ]
+
     runways = _runways()
     matches.sort(
         key=lambda airport: _match_rank(

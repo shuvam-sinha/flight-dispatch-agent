@@ -122,6 +122,53 @@ class TestFindAirport(unittest.TestCase):
         self.assertIn("hint", result)
 
 
+class TestFindAirportQueryForms(unittest.TestCase):
+    """The ways people and models actually name airports.
+
+    Every case here comes from a real transcript or from testing one.
+    Substring search alone handles almost none of them.
+    """
+
+    def first(self, query: str) -> str:
+        result = dispatch("find_airport", {"query": query})
+        self.assertTrue(result["found"], f"no match for {query!r}")
+        return result.get("icao") or result["matches"][0]["icao"]
+
+    def test_iata_code_alone(self):
+        # Not a substring of "John F. Kennedy International Airport".
+        self.assertEqual(self.first("JFK"), "KJFK")
+        self.assertEqual(self.first("LAX"), "KLAX")
+
+    def test_city_plus_code(self):
+        # The failure that prompted all of this: the city is in one field
+        # and the code in another, so the phrase matches nothing.
+        self.assertEqual(self.first("New York JFK"), "KJFK")
+
+    def test_city_plus_generic_word(self):
+        # "Los Angeles airport" IS a substring of "Hilton Los Angeles
+        # Airport Helipad" and is NOT one of "Los Angeles International
+        # Airport", so a phrase-only search returns a hotel helipad.
+        self.assertEqual(self.first("Los Angeles airport"), "KLAX")
+
+    def test_punctuation_is_ignored(self):
+        for query in ("O'Hare", "O Hare", "OHare", "Chicago OHare"):
+            self.assertEqual(self.first(query), "KORD", query)
+
+    def test_unmatchable_word_does_not_kill_the_query(self):
+        # No field holds the country, so requiring every word finds
+        # nothing. Best partial match still gets there.
+        self.assertEqual(self.first("Sydney Australia"), "YSSY")
+
+    def test_common_international_forms(self):
+        self.assertEqual(self.first("London Heathrow"), "EGLL")
+        self.assertEqual(self.first("Tokyo Haneda"), "RJTT")
+        self.assertEqual(self.first("Paris Charles de Gaulle"), "LFPG")
+
+    def test_still_rejects_genuine_nonsense(self):
+        # The relaxations must not make everything match something.
+        self.assertFalse(dispatch("find_airport", {"query": "asdfghjkl"})["found"])
+
+
 class TestListAircraft(unittest.TestCase):
     def test_lists_everything_by_default(self):
         result = dispatch("list_aircraft", {})

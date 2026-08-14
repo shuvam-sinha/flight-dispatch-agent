@@ -378,6 +378,16 @@ real significance signals: airport type, scheduled service, IATA code,
 municipality match, then longest runway (which meant finally opening the
 `runways.csv` that had been sitting in the data directory since CP1).
 
+**`find_airport("New York JFK")` found nothing at all** — the phrase is a
+substring of no field, because the city and the code live in different columns.
+Fixing it exposed a family of related misses, and the search now tries, in
+order: exact ICAO, exact IATA, phrase, all-words-anywhere, best partial match,
+and finally a spacing-blind compare so `OHare` reaches `O'Hare`. Each pass
+*widens* rather than replaces, because phrase search can succeed on the wrong
+thing: "Los Angeles airport" is contained in "Hilton Los Angeles Airport
+Helipad" but not in "Los Angeles International Airport". All candidates go to
+the ranker, which knows a large airport outranks a helipad.
+
 **A wind fetch failure destroyed the whole plan.** Now the route is replanned in
 still air and returned with a `wind_note` saying so. A degraded answer beats no
 answer.
