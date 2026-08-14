@@ -39,6 +39,7 @@ Three things matter more here than in ordinary API design:
      turn. Raising would end the conversation.
 """
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -407,10 +408,17 @@ def list_aircraft(category: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+# Used when the caller names no aircraft. The choice is deliberately a
+# small trainer rather than something that flatters every route: an
+# unrealistic plan should look unrealistic. What matters is that picking
+# it is REPORTED -- see `aircraft_note` below.
+DEFAULT_AIRCRAFT = "c172"
+
+
 def plan_flight(
     origin: str,
     dest: str,
-    aircraft: str = "c172",
+    aircraft: Optional[str] = None,
     use_wind: bool = True,
     avoid_airspace: bool = True,
     altitude_ft: Optional[float] = None,
@@ -439,6 +447,15 @@ def plan_flight(
     if dest_airport is None:
         return {"error": f"Unknown destination ICAO code {dest!r}.",
                 "hint": "Use find_airport to look up the code first."}
+
+    # A missing aircraft is a real gap, not a detail to fill in quietly.
+    # Asked to fly KJFK to EGLL with no type named, this defaulted to a
+    # Cessna 172 and returned a straight-faced plan: 22h15m and 195
+    # gallons, in an aircraft holding 56. The numbers were arithmetically
+    # correct and the answer was nonsense. Tracking the substitution lets
+    # it be reported rather than assumed.
+    aircraft_defaulted = aircraft is None
+    aircraft = aircraft or DEFAULT_AIRCRAFT
 
     try:
         profile = get_aircraft(aircraft)
@@ -548,7 +565,6 @@ def plan_flight(
         "direct_distance_nm": round(plan.direct_distance_nm, 1),
         "route_distance_nm": round(plan.total_distance_nm, 1),
         "wind_applied": use_wind,
-        "airspace_avoidance_applied": avoid_airspace,
     }
 
     if wind_note:
@@ -570,8 +586,37 @@ def plan_flight(
             "map for detail."
         )
 
-    if plan.airspace_avoided is not None:
-        result["restricted_volumes_considered"] = plan.airspace_avoided
+    # A SENTENCE, NOT A COUNT. This previously returned two fields --
+    # `airspace_avoidance_applied: true` and
+    # `restricted_volumes_considered: 95` -- and the model assembled them
+    # into "Route includes prohibited and restricted airspace", which is
+    # the exact opposite of what happened. The route crossed none of them.
+    #
+    # The fault was in the field names, not the model. "Considered" reads
+    # equally well as "taken into account" and "included in", and beside
+    # a count of 95 the second reading is the more natural one. The
+    # numbers were all correct and the safety claim came out inverted --
+    # which no test caught, because the router was never wrong.
+    #
+    # So the tool states the conclusion and the model relays it. The same
+    # rule as "the model never does computation", extended to
+    # interpretation: a result that can be read two ways should not be
+    # handed over as raw fields for the model to interpret.
+    if not avoid_airspace:
+        result["restricted_airspace"] = (
+            "NOT CHECKED -- airspace avoidance was disabled for this plan, so "
+            "the route may pass through prohibited or restricted areas."
+        )
+    elif plan.airspace_avoided:
+        result["restricted_airspace"] = (
+            f"Routed clear of {plan.airspace_avoided} active "
+            "prohibited/restricted/warning areas. The route crosses none of "
+            "them."
+        )
+    else:
+        result["restricted_airspace"] = (
+            "No active prohibited or restricted areas lie near this route."
+        )
 
     if plan.grid_waypoints_used:
         result["oceanic_waypoints"] = plan.grid_waypoints_used
@@ -629,11 +674,39 @@ def plan_flight(
 
     endurance = profile.endurance_hours(payload)
     result["within_aircraft_range"] = hours_en_route <= endurance
+
     if hours_en_route > endurance:
-        result["range_warning"] = (
-            f"Flight time of {whole_hours}h{minutes:02d}m exceeds the "
-            f"{profile.name}'s {endurance:.1f} h endurance. A fuel stop is "
-            "required -- tell the user this plainly."
+        # "A fuel stop is required" is the right advice for an aircraft
+        # falling short overland. It is the wrong advice for a Cessna 172
+        # over the North Atlantic, where there is nowhere to stop.
+        #
+        # The discriminator is NOT how far short the aircraft falls. A
+        # 172 crossing the United States needs four stops and that is a
+        # trip people genuinely make. What makes the Atlantic different
+        # is that the legs are over open water, so the advice cannot be
+        # followed -- and the oceanic waypoints already tell us that.
+        stops = math.ceil(hours_en_route / endurance) - 1
+        if plan.grid_waypoints_used:
+            result["range_warning"] = (
+                f"The {profile.name} cannot fly this route. Flight time is "
+                f"{whole_hours}h{minutes:02d}m against {endurance:.1f} h of "
+                f"endurance, and the route crosses open water where there is "
+                "nowhere to refuel. Say plainly that this is the wrong "
+                "aircraft for the trip, and suggest planning again with a "
+                "type that has the range."
+            )
+        else:
+            result["range_warning"] = (
+                f"Flight time of {whole_hours}h{minutes:02d}m exceeds the "
+                f"{profile.name}'s {endurance:.1f} h endurance. About "
+                f"{stops} fuel stop{'s' if stops != 1 else ''} would be needed "
+                "-- tell the user this plainly."
+            )
+
+    if aircraft_defaulted:
+        result["aircraft_note"] = (
+            f"No aircraft was specified, so this was planned for a "
+            f"{profile.name}. Tell the user which aircraft was assumed."
         )
 
     return result
@@ -818,7 +891,13 @@ TOOLS: List[ToolSpec] = [
                     "e175 (Embraer E175), a320n (Airbus A320neo), "
                     "b738 (Boeing 737-800), b789 (Boeing 787-9), "
                     "b77w (Boeing 777-300ER), a388 (Airbus A380). "
-                    "If the user did not name an aircraft, use c172."
+                    # This used to read "if the user did not name an
+                    # aircraft, use c172", and the model dutifully passed
+                    # c172 for a transatlantic crossing. Omitting the
+                    # parameter lets the tool record that nobody chose,
+                    # and say so in the result.
+                    "OMIT this parameter entirely if the user did not name an "
+                    "aircraft -- do not guess one."
                 ),
                 "enum": sorted(AIRCRAFT),
                 "required": False,

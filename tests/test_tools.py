@@ -249,11 +249,57 @@ class TestPlanFlight(unittest.TestCase):
     def test_reports_whether_wind_was_applied(self):
         self.assertFalse(self.plan()["wind_applied"])
 
-    def test_airspace_flag_is_reported(self):
-        self.assertIn("airspace_avoidance_applied", self.plan())
+    def test_airspace_result_is_an_unambiguous_sentence(self):
+        # THE BUG THIS REPLACES. The result used to carry
+        # `airspace_avoidance_applied: true` alongside
+        # `restricted_volumes_considered: 95`, and the model combined
+        # them into "Route includes prohibited and restricted airspace"
+        # -- the precise opposite of the truth. Every number was right;
+        # the English was inverted. The tool now states the conclusion.
+        text = self.plan()["restricted_airspace"]
+        self.assertIn("crosses none", text)
+        self.assertNotIn("considered", text)
+
+    def test_airspace_says_so_when_avoidance_is_off(self):
+        text = self.plan(avoid_airspace=False)["restricted_airspace"]
+        self.assertIn("NOT CHECKED", text)
+        self.assertNotIn("crosses none", text)
 
     def test_no_map_unless_asked(self):
         self.assertNotIn("map_file", self.plan())
+
+    def test_unspecified_aircraft_is_reported_not_assumed(self):
+        # THE BUG THIS REPLACES. Asked for KJFK to EGLL with no aircraft
+        # named, the tool silently defaulted to a Cessna 172 and returned
+        # a straight-faced plan. Defaulting is fine; doing it quietly is
+        # not.
+        self.assertIn("aircraft_note", self.plan())
+
+    def test_named_aircraft_gets_no_note(self):
+        self.assertNotIn("aircraft_note", self.plan(aircraft="sr22"))
+
+    def test_oceanic_route_beyond_range_is_called_impossible(self):
+        # 22h15m in an aircraft holding 56 gal, over the Atlantic. "A
+        # fuel stop is required" is advice that cannot be taken.
+        result = dispatch(
+            "plan_flight",
+            {"origin": "KJFK", "dest": "EGLL", "aircraft": "c172", "use_wind": False},
+        )
+        self.assertFalse(result["within_aircraft_range"])
+        self.assertIn("cannot fly this route", result["range_warning"])
+        self.assertIn("nowhere to refuel", result["range_warning"])
+
+    def test_overland_route_beyond_range_suggests_fuel_stops(self):
+        # A 172 crossing the US needs several stops, which is a trip
+        # people actually make. The distinction is water, not distance --
+        # this route is longer in hours than some oceanic ones.
+        result = dispatch(
+            "plan_flight",
+            {"origin": "KJFK", "dest": "KLAX", "aircraft": "c172", "use_wind": False},
+        )
+        self.assertFalse(result["within_aircraft_range"])
+        self.assertIn("fuel stop", result["range_warning"])
+        self.assertNotIn("cannot fly", result["range_warning"])
 
     def test_route_is_never_shorter_than_direct(self):
         result = self.plan()

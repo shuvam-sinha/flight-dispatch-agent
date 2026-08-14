@@ -388,6 +388,45 @@ thing: "Los Angeles airport" is contained in "Hilton Los Angeles Airport
 Helipad" but not in "Los Angeles International Airport". All candidates go to
 the ranker, which knows a large airport outranks a helipad.
 
+**The airspace result was narrated backwards.** The router avoided all 95
+restricted areas near a route — and the reply said *"Route includes prohibited
+and restricted airspace."* Every number was correct; the safety claim came out
+inverted. The cause was two fields the model had to assemble itself:
+
+```python
+"airspace_avoidance_applied": True
+"restricted_volumes_considered": 95
+```
+
+"Considered" reads equally well as *taken into account* and *included in*, and
+beside a count of 95 the second reading is the more natural one. The fix was to
+return the conclusion as a sentence — `"Routed clear of 95 active volumes. The
+route crosses none of them."` — which cannot be read the other way.
+
+This generalised the project's founding rule. "The LLM never does computation"
+was not enough: `95` is a number the model reported faithfully, and *through*
+versus *around* is an interpretation built from the identical number. So the
+rule is now **the LLM never does computation, and never decides what a result
+means either.** Any field a reasonable reader could draw the opposite conclusion
+from should be a sentence, not a value.
+
+No test caught this, because every test checked the router, and the router was
+never wrong.
+
+**An unspecified aircraft was filled in silently.** Asked to fly KJFK to EGLL
+with no type named, `plan_flight` defaulted to a Cessna 172 and returned a
+straight-faced plan: 22h15m and 195 gallons, in an aircraft holding 56. The
+default now reports itself, and the schema tells the model to omit the parameter
+rather than guess.
+
+The range warning was wrong in a subtler way: it said *"a fuel stop is
+required."* The discriminator turned out not to be how far short the aircraft
+falls — a 172 crossing the United States needs four stops, and that is a trip
+people genuinely make. What makes the Atlantic different is that there is
+nowhere to land, and the oceanic waypoints already record exactly that. Overland
+shortfalls suggest fuel stops; oceanic ones say the aircraft cannot fly the
+route.
+
 **A wind fetch failure destroyed the whole plan.** Now the route is replanned in
 still air and returned with a `wind_note` saying so. A degraded answer beats no
 answer.
