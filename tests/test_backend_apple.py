@@ -64,10 +64,24 @@ class TestParameterExposure(unittest.TestCase):
     def test_free_strings_are_withheld(self):
         self.assertFalse(_is_exposed({"type": "string", "required": False}))
 
-    def test_plan_flight_withholds_the_dangerous_numerics(self):
+    def test_plan_flight_withholds_free_numerics(self):
+        # payload_lb has no sensible enum -- any weight is arguable -- so
+        # it stays withheld, which is what stopped the model inventing
+        # 1,600 lb for a Cessna 172.
         params = TOOLS_BY_NAME["plan_flight"].parameters
         self.assertFalse(_is_exposed(params["payload_lb"]))
-        self.assertFalse(_is_exposed(params["altitude_ft"]))
+
+    def test_altitude_reaches_the_model_as_an_enum(self):
+        # Withholding altitude_ft outright was the wrong answer. Asked
+        # for the wind at 35,000 ft, get_winds_aloft could not be given
+        # one and answered at its 8,000 ft default -- 12 kt from 239 at
+        # +11.9 C, reported as the 35,000 ft wind. The real value was
+        # 26 kt from 223 at -41 C. An enum passes the filter and still
+        # stops the model inventing 37,412 ft.
+        for name in ("get_winds_aloft", "check_airspace", "plan_flight"):
+            spec = TOOLS_BY_NAME[name].parameters["altitude_ft"]
+            self.assertTrue(_is_exposed(spec), name)
+            self.assertIn("enum", spec, name)
 
     def test_plan_flight_still_exposes_what_the_model_needs(self):
         params = TOOLS_BY_NAME["plan_flight"].parameters

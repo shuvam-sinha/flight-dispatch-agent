@@ -101,7 +101,7 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
 
 ```bash
-python -m unittest discover tests      # 353 tests
+python -m unittest discover tests      # 369 tests
 ```
 
 ## Layout
@@ -522,6 +522,33 @@ by late evening. The data was genuinely live, from the current model run; it was
 being read at the wrong point in it. The response carries its own timestamps, so
 the index is now looked up rather than assumed.
 
+**The wind altitude could not be asked for.** Asked for the wind at 35,000 ft
+over Denver, the agent answered *12 kt from 239°, 11.9°C* and called it the
+35,000 ft wind. The true value was **26 kt from 223°, −41°C**. The temperature
+gives it away — nothing at FL350 is ever +12°.
+
+The model was not being careless. `_is_exposed` withholds free numerics from
+Apple's schema, which was the fix for the invented `payload_lb: 1600`. The side
+effect was that `altitude_ft` could not be passed to `get_winds_aloft` **at
+all** — so it answered at its 8,000 ft default, truthfully, and the model
+attached the user's altitude to it. `altitude_ft` is now an enum of ten
+altitudes, which passes the filter the same way `aircraft` does, with values
+chosen to land on distinct pressure levels so no two options return identical
+data.
+
+The schema fix alone was not enough, because the altitude was **already** a
+field in the result and the model skipped it — a bare number beside other bare
+numbers is easy to skip. The wind result now names its own altitude in the same
+sentence as the wind:
+
+```
+At 34,000 ft: wind from 223 degrees true (southwest) at 26 kt, temperature -41C.
+```
+
+Same principle as the airspace fix: a result that states what it is cannot be
+relabelled. The compass point is there for a related reason — the model rendered
+239° as "from the northeast", which is the opposite side of the compass.
+
 **A wind fetch failure destroyed the whole plan.** Now the route is replanned in
 still air and returned with a `wind_note` saying so. A degraded answer beats no
 answer.
@@ -565,4 +592,4 @@ larger-context model drops in.
 - Oceanic routing measured before and after the grid on five routes, including
   two overland controls that must *not* change
 - The agent loop tested against a `ScriptedBackend` — no model, no network
-- **353 unit tests**
+- **369 unit tests**

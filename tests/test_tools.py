@@ -253,6 +253,139 @@ class TestCityNamePicksTheMainAirport(unittest.TestCase):
             self.assertEqual(first, "MMMX", query)
 
 
+class TestCompassPoint(unittest.TestCase):
+    """The model rendered 239 degrees as "from the northeast". It is not."""
+
+    def test_cardinals(self):
+        from flight_dispatch.tools import _compass_point
+
+        self.assertEqual(_compass_point(0), "north")
+        self.assertEqual(_compass_point(90), "east")
+        self.assertEqual(_compass_point(180), "south")
+        self.assertEqual(_compass_point(270), "west")
+
+    def test_the_bearing_that_was_reported_backwards(self):
+        from flight_dispatch.tools import _compass_point
+
+        self.assertEqual(_compass_point(239), "west-southwest")
+        self.assertNotIn("northeast", _compass_point(239))
+
+    def test_wraps_past_360(self):
+        from flight_dispatch.tools import _compass_point
+
+        self.assertEqual(_compass_point(359), "north")
+        self.assertEqual(_compass_point(361), "north")
+
+
+class TestAltitudeCoercion(unittest.TestCase):
+    """The schema carries enum strings; the CLI passes floats."""
+
+    def test_a_string_from_the_enum(self):
+        from flight_dispatch.tools import _coerce_altitude
+
+        self.assertEqual(_coerce_altitude("34000", 8000.0), 34000.0)
+
+    def test_a_float_from_the_cli(self):
+        from flight_dispatch.tools import _coerce_altitude
+
+        self.assertEqual(_coerce_altitude(34000.0, 8000.0), 34000.0)
+
+    def test_missing_falls_back_to_the_default(self):
+        from flight_dispatch.tools import _coerce_altitude
+
+        self.assertEqual(_coerce_altitude(None, 8000.0), 8000.0)
+        self.assertEqual(_coerce_altitude("", 8000.0), 8000.0)
+
+    def test_nonsense_is_reported_not_guessed(self):
+        from flight_dispatch.tools import _coerce_altitude
+
+        self.assertIsNone(_coerce_altitude("high", 8000.0))
+
+    def test_every_choice_parses(self):
+        from flight_dispatch.tools import ALTITUDE_CHOICES, _coerce_altitude
+
+        for choice in ALTITUDE_CHOICES:
+            self.assertIsInstance(_coerce_altitude(choice, 0.0), float)
+
+    def test_choices_land_on_distinct_pressure_levels(self):
+        # Two options either side of one level would return identical
+        # wind and imply precision that is not there.
+        from flight_dispatch.wind import nearest_pressure_level
+        from flight_dispatch.tools import ALTITUDE_CHOICES
+
+        levels = [nearest_pressure_level(float(c)) for c in ALTITUDE_CHOICES]
+        self.assertEqual(len(levels), len(set(levels)))
+
+
+class TestWindResultNamesItsAltitude(unittest.TestCase):
+    """THE BUG THIS COVERS.
+
+    Asked for the wind at 35,000 ft, this answered at its 8,000 ft
+    default -- 12 kt from 239 degrees at +11.9 C -- and the model
+    reported it as the 35,000 ft wind. The true value was 26 kt from
+    223 at -41 C. The altitude was already a field in the result; that
+    was not enough. It now sits in the same sentence as the numbers.
+
+    Uses a stubbed wind source so the assertions do not depend on
+    today's weather.
+    """
+
+    def call(self, **kwargs):
+        from unittest.mock import patch
+
+        from flight_dispatch.wind import Wind
+
+        stub = Wind(direction_deg=239.0, speed_kt=12.0, altitude_ft=0.0,
+                    temperature_c=11.9)
+        with patch("flight_dispatch.wind_openmeteo.OpenMeteoWindSource") as source:
+            source.return_value.wind_at.return_value = stub
+            return dispatch(
+                "get_winds_aloft",
+                {"latitude": 39.86, "longitude": -104.67, **kwargs},
+            )
+
+    def test_summary_states_the_altitude_used(self):
+        result = self.call(altitude_ft="34000")
+        self.assertIn("34,000 ft", result["summary"])
+
+    def test_summary_states_the_default_when_none_was_asked_for(self):
+        result = self.call()
+        self.assertIn("8,000 ft", result["summary"])
+
+    def test_summary_carries_the_wind_in_the_same_sentence(self):
+        result = self.call(altitude_ft="34000")
+        self.assertIn("239", result["summary"])
+        self.assertIn("12 kt", result["summary"])
+
+    def test_summary_names_the_compass_quadrant(self):
+        result = self.call(altitude_ft="34000")
+        self.assertIn("west-southwest", result["summary"])
+
+    def test_altitude_actually_reaches_the_wind_source(self):
+        # The whole failure was that it did not.
+        from unittest.mock import patch
+
+        from flight_dispatch.wind import Wind
+
+        stub = Wind(direction_deg=223.0, speed_kt=26.0, altitude_ft=0.0,
+                    temperature_c=-41.0)
+        with patch("flight_dispatch.wind_openmeteo.OpenMeteoWindSource") as source:
+            source.return_value.wind_at.return_value = stub
+            dispatch(
+                "get_winds_aloft",
+                {"latitude": 39.86, "longitude": -104.67, "altitude_ft": "34000"},
+            )
+            _, _, altitude = source.return_value.wind_at.call_args[0]
+            self.assertEqual(altitude, 34000.0)
+
+    def test_unreadable_altitude_is_an_error_not_a_guess(self):
+        result = dispatch(
+            "get_winds_aloft",
+            {"latitude": 39.86, "longitude": -104.67, "altitude_ft": "cruise"},
+        )
+        self.assertIn("error", result)
+
+
 class TestListAircraft(unittest.TestCase):
     def test_lists_everything_by_default(self):
         result = dispatch("list_aircraft", {})

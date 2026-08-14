@@ -82,6 +82,69 @@ MAX_DETAILED_WAYPOINTS = 12
 # were discarded the moment the model chose one.
 MAX_AIRPORT_MATCHES = 3
 
+DEFAULT_WIND_ALTITUDE_FT = 8000.0
+
+# Altitudes the model may ask for, as strings because that is what a
+# schema enum carries.
+#
+# WHY AN ENUM AT ALL. Apple's schema format cannot express an optional
+# parameter, so `backend_apple._is_exposed` withholds free numerics --
+# the fix for a model that invented `payload_lb: 1600` for a Cessna 172
+# and made both plans refuse. The side effect was that `altitude_ft`
+# could not be passed to this tool AT ALL on-device: asked for the wind
+# at 35,000 ft it always answered at the 8,000 ft default, and said
+# 35,000. An enum survives the filter, exactly as `aircraft` does.
+#
+# These values are chosen to land on DISTINCT pressure levels. Wind is
+# published at pressure levels, not arbitrary altitudes, so two options
+# either side of one level would return identical data and imply a
+# precision that is not there.
+ALTITUDE_CHOICES = (
+    "3000",
+    "5000",
+    "10000",
+    "14000",
+    "18000",
+    "24000",
+    "30000",
+    "34000",
+    "39000",
+    "45000",
+)
+
+_COMPASS = (
+    "north", "north-northeast", "northeast", "east-northeast",
+    "east", "east-southeast", "southeast", "south-southeast",
+    "south", "south-southwest", "southwest", "west-southwest",
+    "west", "west-northwest", "northwest", "north-northwest",
+)
+
+
+def _compass_point(degrees: float) -> str:
+    """Name the 16-point compass direction for a bearing.
+
+    Included in wind results because the model got it wrong unprompted:
+    it rendered 239 degrees as "from the northeast", which is the
+    opposite side of the compass. Converting degrees to a quadrant is
+    arithmetic, and arithmetic is not the model's job here.
+    """
+    return _COMPASS[int((degrees % 360) / 22.5 + 0.5) % 16]
+
+
+def _coerce_altitude(value: Any, default: float) -> Optional[float]:
+    """Read an altitude that may arrive as a number or an enum string.
+
+    The schema carries strings, since that is what enums hold, but the
+    CLI and the tests pass floats. Returns None if it is neither, so the
+    caller can answer with an error the model can act on.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 _CACHE: Dict[str, Any] = {}
 
 
@@ -472,7 +535,7 @@ def plan_flight(
     aircraft: Optional[str] = None,
     use_wind: bool = True,
     avoid_airspace: bool = True,
-    altitude_ft: Optional[float] = None,
+    altitude_ft: Optional[Any] = None,
     payload_lb: Optional[float] = None,
     save_map: bool = False,
 ) -> Dict[str, Any]:
@@ -523,7 +586,14 @@ def plan_flight(
             )
         }
 
-    altitude = altitude_ft or profile.cruise_altitude_ft
+    # `altitude_ft` may arrive as an enum string from the schema or a
+    # float from the CLI.
+    altitude = _coerce_altitude(altitude_ft, profile.cruise_altitude_ft)
+    if altitude is None:
+        return {
+            "error": f"Could not read {altitude_ft!r} as an altitude in feet.",
+            "hint": f"Use one of: {', '.join(ALTITUDE_CHOICES)}.",
+        }
     if not profile.can_fly_at(altitude):
         return {
             "error": (
@@ -815,31 +885,78 @@ def _describe_waypoints(plan) -> List[Dict[str, Any]]:
 
 
 def get_winds_aloft(
-    latitude: float, longitude: float, altitude_ft: float = 8000.0
+    latitude: float,
+    longitude: float,
+    altitude_ft: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Wind at a single point and altitude."""
     from .wind_openmeteo import OpenMeteoWindSource, WindDataError
 
+    altitude = _coerce_altitude(altitude_ft, DEFAULT_WIND_ALTITUDE_FT)
+    if altitude is None:
+        return {
+            "error": f"Could not read {altitude_ft!r} as an altitude in feet.",
+            "hint": f"Use one of: {', '.join(ALTITUDE_CHOICES)}.",
+        }
+
     try:
-        wind = OpenMeteoWindSource().wind_at(latitude, longitude, altitude_ft)
+        wind = OpenMeteoWindSource().wind_at(latitude, longitude, altitude)
     except WindDataError as exc:
         return {"error": f"Could not fetch winds: {exc}"}
 
+    direction = round(wind.direction_deg)
+    speed = round(wind.speed_kt)
+
+    # THE RESULT NAMES ITS ALTITUDE IN THE SAME SENTENCE AS THE NUMBERS.
+    #
+    # Asked for the wind at 35,000 ft, this returned the 8,000 ft wind --
+    # 12 kt from 239 degrees at +11.9 C -- and the model reported it as
+    # "the wind at 35,000 ft". The real answer was 26 kt from 223 at
+    # -41 C. The tool had answered the only question the schema let the
+    # model ask, and the model attached the user's question to it.
+    #
+    # `altitude_ft` was already in the result as its own field, and that
+    # was not enough: a bare number beside other bare numbers is easy to
+    # skip. Binding the altitude into the same string as the wind is what
+    # makes the two impossible to separate.
+    #
+    # The compass point is here for a related reason. The model rendered
+    # 239 degrees as "from the northeast", which is backwards -- 239 is
+    # southwest. Naming the quadrant removes the invitation to convert.
+    summary = (
+        f"At {altitude:,.0f} ft: wind from {direction:03d} degrees true "
+        f"({_compass_point(direction)}) at {speed} kt"
+    )
+    if wind.temperature_c is not None:
+        summary += f", temperature {wind.temperature_c:.0f}C"
+    summary += "."
+
     return {
+        "summary": summary,
         "latitude": latitude,
         "longitude": longitude,
-        "altitude_ft": altitude_ft,
-        "wind_from_degrees_true": round(wind.direction_deg),
-        "wind_speed_kt": round(wind.speed_kt),
+        "altitude_ft": altitude,
+        "wind_from_degrees_true": direction,
+        "wind_speed_kt": speed,
         "temperature_c": wind.temperature_c,
-        "note": "Direction is where the wind blows FROM, per aviation convention.",
+        "note": (
+            "Report the altitude named in `summary`. Wind comes from fixed "
+            "pressure levels, so it may differ from the altitude asked "
+            "about. Direction is where the wind blows FROM."
+        ),
     }
 
 
 def check_airspace(
-    origin: str, dest: str, altitude_ft: float = 8000.0
+    origin: str, dest: str, altitude_ft: Optional[Any] = None
 ) -> Dict[str, Any]:
     """Which restricted areas lie along a direct course, before routing."""
+    altitude = _coerce_altitude(altitude_ft, DEFAULT_WIND_ALTITUDE_FT)
+    if altitude is None:
+        return {
+            "error": f"Could not read {altitude_ft!r} as an altitude in feet.",
+            "hint": f"Use one of: {', '.join(ALTITUDE_CHOICES)}.",
+        }
     airports = _airports()
     origin_airport = airports.get(origin.strip().upper())
     dest_airport = airports.get(dest.strip().upper())
@@ -858,7 +975,7 @@ def check_airspace(
             origin_airport.lat, origin_airport.lon,
             dest_airport.lat, dest_airport.lon,
         ),
-        altitude_ft=altitude_ft,
+        altitude_ft=altitude,
     )
 
     crossings = index.crossings(
@@ -868,7 +985,7 @@ def check_airspace(
 
     return {
         "route": f"{origin_airport.icao} to {dest_airport.icao}",
-        "altitude_ft": altitude_ft,
+        "altitude_ft": altitude,
         "active_volumes_in_region": len(index),
         "direct_course_crossings": [
             {
@@ -996,8 +1113,12 @@ TOOLS: List[ToolSpec] = [
                 "required": False,
             },
             "altitude_ft": {
-                "type": "number",
-                "description": "Cruise altitude in feet. Defaults to the aircraft's normal cruise.",
+                "type": "string",
+                "description": (
+                    "Cruise altitude in feet. Omit to use the aircraft's own "
+                    "normal cruise altitude, which is usually right."
+                ),
+                "enum": list(ALTITUDE_CHOICES),
                 "required": False,
             },
             "payload_lb": {
@@ -1030,8 +1151,14 @@ TOOLS: List[ToolSpec] = [
             "latitude": {"type": "number", "description": "Latitude in degrees.", "required": True},
             "longitude": {"type": "number", "description": "Longitude in degrees.", "required": True},
             "altitude_ft": {
-                "type": "number",
-                "description": "Altitude in feet. Default 8000.",
+                "type": "string",
+                "description": (
+                    "Altitude in feet. ALWAYS set this when the user names an "
+                    "altitude or flight level -- wind changes completely with "
+                    "height, and the default of 8000 is a low-level answer. "
+                    "Pick the closest listed value."
+                ),
+                "enum": list(ALTITUDE_CHOICES),
                 "required": False,
             },
         },
@@ -1049,8 +1176,12 @@ TOOLS: List[ToolSpec] = [
             "origin": {"type": "string", "description": "Origin ICAO code.", "required": True},
             "dest": {"type": "string", "description": "Destination ICAO code.", "required": True},
             "altitude_ft": {
-                "type": "number",
-                "description": "Cruise altitude in feet. Airspace is altitude-banded. Default 8000.",
+                "type": "string",
+                "description": (
+                    "Cruise altitude in feet. Airspace is altitude-banded, so "
+                    "this changes which areas are active. Default 8000."
+                ),
+                "enum": list(ALTITUDE_CHOICES),
                 "required": False,
             },
         },
