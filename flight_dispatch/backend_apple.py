@@ -44,6 +44,7 @@ CONSTRAINTS OF THE ON-DEVICE MODEL
 """
 
 import asyncio
+import json
 from typing import Any, Dict, List, Optional, Sequence
 
 from .agent import ModelResponse, ToolCall, ToolResult
@@ -56,6 +57,16 @@ try:
 except ImportError:  # pragma: no cover - environment-dependent
     afm = None
     SDK_AVAILABLE = False
+
+
+# The on-device model's context window. Everything -- instructions, tool
+# schemas, every message and every tool result -- competes for this.
+CONTEXT_LIMIT_TOKENS = 4096
+
+# Tokens are estimated from character count, since the SDK exposes no
+# counter. Four characters per token is the usual rule of thumb for
+# English prose and close enough to watch a window fill.
+CHARS_PER_TOKEN = 4
 
 
 class AppleBackendUnavailable(RuntimeError):
@@ -87,9 +98,17 @@ def _is_exposed(spec: Dict[str, Any]) -> bool:
       exposed      booleans -- two possible values, both survivable, and
                    the Python default already encodes the sane one
       exposed      enums -- `anyOf` constrains the model to real values
-      WITHHELD     free numbers -- payload_lb, altitude_ft. Plausible and
-                   harmful is the worst combination, and the Python
-                   defaults are better than any guess.
+      WITHHELD     free numbers -- payload_lb. Plausible and harmful is
+                   the worst combination, and the Python default is
+                   better than any guess.
+
+    Withholding is a blunt instrument, and it cut too deep once. Asked
+    for the wind at 35,000 ft, `get_winds_aloft` could not be given an
+    altitude at all, so it answered at its 8,000 ft default and the model
+    labelled that answer 35,000 ft. Where a parameter genuinely must
+    reach the model, the answer is to give it an enum rather than to
+    leave it withheld -- which is how `aircraft` and `altitude_ft` both
+    now get through.
 
     Withheld parameters are not lost: `plan_flight` still has them, and
     they still work from the CLI or from a backend that can express
@@ -365,6 +384,49 @@ class AppleBackend:
             for call in self.calls_this_turn
             if call.id in by_id
         ]
+
+    def context_usage(self) -> Optional[dict]:
+        """Roughly how full the context window is, broken down by role.
+
+        The SDK publishes no token counter, so this estimates from the
+        transcript's own JSON at four characters per token -- the usual
+        rule of thumb for English. It is an estimate and is labelled as
+        one wherever it is shown; what matters is watching it move, not
+        its third digit.
+
+        The breakdown is the useful part. It was measuring this that
+        found one `find_airport("Chicago")` sitting at 41% of an entire
+        conversation, which is what prompted trimming the candidate list.
+
+        Returns None when there is no session yet, or if the SDK will not
+        hand over a transcript -- a diagnostic must never be the thing
+        that breaks a conversation.
+        """
+        if self.session is None:
+            return None
+
+        try:
+            payload = asyncio.run(self.session.transcript.to_dict())
+            entries = payload["transcript"]["entries"]
+        except Exception:  # noqa: BLE001 - diagnostics are never fatal
+            return None
+
+        by_role: Dict[str, int] = {}
+        total = 0
+        for entry in entries:
+            size = len(json.dumps(entry)) // CHARS_PER_TOKEN
+            by_role[entry.get("role", "?")] = by_role.get(entry.get("role", "?"), 0) + size
+            total += size
+
+        # The model reports its own window; the constant is only a
+        # fallback for when it has not been asked yet.
+        limit = getattr(self, "context_size", None) or CONTEXT_LIMIT_TOKENS
+        return {
+            "total": total,
+            "limit": limit,
+            "percent": 100.0 * total / limit,
+            "by_role": by_role,
+        }
 
     def reset(self) -> None:
         """Start a fresh conversation, discarding history.

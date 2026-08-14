@@ -201,6 +201,44 @@ Examples
 """
 
 
+def format_context(usage: Optional[dict], previous_total: Optional[int]) -> str:
+    """One dim line showing how full the context window is.
+
+    Printed after every turn because the on-device window is 4,096
+    tokens and there is no other way to see it filling. The delta is the
+    part worth watching -- it tells you which questions are expensive,
+    and a route with thirty waypoints costs far more than a lookup.
+
+    A bar rather than a bare percentage, because the useful judgement is
+    "am I close" and that reads faster than a number.
+    """
+    if not usage:
+        return ""
+
+    total, limit = usage["total"], usage["limit"]
+    percent = usage["percent"]
+
+    filled = min(20, int(percent / 5))
+    bar = "█" * filled + "·" * (20 - filled)
+
+    line = f"  [{bar}] {total:,}/{limit:,} tokens (~{percent:.0f}%)"
+    if previous_total is not None:
+        line += f"  +{total - previous_total:,} this turn"
+
+    # The breakdown answers the obvious next question: what is taking up
+    # the room. Tool results usually dominate, which is not the guess
+    # most people make.
+    roles = usage["by_role"]
+    parts = [
+        f"{role} {count:,}"
+        for role, count in sorted(roles.items(), key=lambda kv: -kv[1])
+        if count
+    ]
+    if parts:
+        line += "\n  " + " · ".join(parts)
+    return line
+
+
 def run_session(agent: DispatcherAgent, backend, tools, show_tools: bool) -> int:
     print(bold("Flight Dispatch Assistant"))
     print(dim(f"  {backend.name} · {len(tools)} tools · /help for commands"))
@@ -212,6 +250,8 @@ def run_session(agent: DispatcherAgent, backend, tools, show_tools: bool) -> int
             )
         )
     print()
+
+    previous_total: Optional[int] = None
 
     while True:
         try:
@@ -239,6 +279,7 @@ def run_session(agent: DispatcherAgent, backend, tools, show_tools: bool) -> int
             if hasattr(backend, "reset"):
                 backend.reset()
                 agent.turns.clear()
+                previous_total = None
                 print(dim("  conversation cleared\n"))
             else:
                 print(dim("  this backend cannot reset\n"))
@@ -260,6 +301,13 @@ def run_session(agent: DispatcherAgent, backend, tools, show_tools: bool) -> int
                 print()
 
         print(turn.reply)
+
+        usage = backend.context_usage() if hasattr(backend, "context_usage") else None
+        line = format_context(usage, previous_total)
+        if line:
+            print()
+            print(dim(line))
+            previous_total = usage["total"]
         print()
 
 
@@ -279,6 +327,11 @@ def main(argv=None) -> int:
                 print(dim(f"    {summarise_result(result)}"))
             print()
         print(turn.reply)
+        if not args.quiet and hasattr(backend, "context_usage"):
+            line = format_context(backend.context_usage(), None)
+            if line:
+                print()
+                print(dim(line))
         return 0
 
     return run_session(agent, backend, tools, show_tools=not args.quiet)

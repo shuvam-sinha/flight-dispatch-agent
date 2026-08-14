@@ -200,3 +200,62 @@ class TestCallResultPairing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestContextDisplay(unittest.TestCase):
+    """The context meter shown after every turn.
+
+    The on-device window is 4,096 tokens and nothing else reveals it
+    filling. Measuring it is also how the oversized find_airport result
+    was found -- one lookup was 41% of a whole conversation.
+    """
+
+    def usage(self, total=1000, limit=4096, **roles):
+        return {
+            "total": total,
+            "limit": limit,
+            "percent": 100.0 * total / limit,
+            "by_role": roles or {"user": total},
+        }
+
+    def test_no_usage_renders_nothing(self):
+        import sys, pathlib
+
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+        from dispatch import format_context
+
+        self.assertEqual(format_context(None, None), "")
+
+    def test_shows_total_and_limit(self):
+        from dispatch import format_context
+
+        line = format_context(self.usage(2781, 4096), None)
+        self.assertIn("2,781/4,096", line)
+
+    def test_bar_grows_with_usage(self):
+        from dispatch import format_context
+
+        empty = format_context(self.usage(0, 4096), None)
+        full = format_context(self.usage(4096, 4096), None)
+        self.assertLess(empty.count("█"), full.count("█"))
+
+    def test_bar_does_not_overflow_past_the_limit(self):
+        from dispatch import format_context
+
+        line = format_context(self.usage(9999, 4096), None)
+        self.assertLessEqual(line.count("█"), 20)
+
+    def test_delta_appears_once_there_is_a_previous_total(self):
+        from dispatch import format_context
+
+        self.assertNotIn("this turn", format_context(self.usage(2000), None))
+        self.assertIn("+500", format_context(self.usage(2000), 1500))
+
+    def test_breakdown_is_ordered_largest_first(self):
+        from dispatch import format_context
+
+        line = format_context(
+            self.usage(1000, instructions=700, tool=200, user=100), None
+        )
+        self.assertLess(line.index("instructions"), line.index("tool"))
+        self.assertLess(line.index("tool"), line.index("user"))
