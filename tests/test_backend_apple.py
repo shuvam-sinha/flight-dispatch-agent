@@ -71,17 +71,28 @@ class TestParameterExposure(unittest.TestCase):
         params = TOOLS_BY_NAME["plan_flight"].parameters
         self.assertFalse(_is_exposed(params["payload_lb"]))
 
-    def test_altitude_reaches_the_model_as_an_enum(self):
-        # Withholding altitude_ft outright was the wrong answer. Asked
-        # for the wind at 35,000 ft, get_winds_aloft could not be given
-        # one and answered at its 8,000 ft default -- 12 kt from 239 at
-        # +11.9 C, reported as the 35,000 ft wind. The real value was
-        # 26 kt from 223 at -41 C. An enum passes the filter and still
-        # stops the model inventing 37,412 ft.
-        for name in ("get_winds_aloft", "check_airspace", "plan_flight"):
+    def test_altitude_reaches_the_model_where_it_is_the_question(self):
+        # Withholding altitude_ft everywhere was wrong. Asked for the
+        # wind at 35,000 ft, get_winds_aloft could not be given one and
+        # answered at its 8,000 ft default -- 12 kt from 239 at +11.9 C,
+        # reported as the 35,000 ft wind. The real value was 26 kt from
+        # 223 at -41 C. Wind without an altitude is meaningless, so an
+        # enum lets it through while still stopping invented values.
+        for name in ("get_winds_aloft", "check_airspace"):
             spec = TOOLS_BY_NAME[name].parameters["altitude_ft"]
             self.assertTrue(_is_exposed(spec), name)
             self.assertIn("enum", spec, name)
+
+    def test_plan_flight_altitude_stays_withheld(self):
+        # And exposing it everywhere was also wrong. Given "KJFK to KLAX
+        # in a 737" the model volunteered altitude_ft=30000 unasked, then
+        # carried it into "what about in a 172?" -- an aircraft with a
+        # 14,000 ft ceiling -- and the plan was refused. The aircraft
+        # profile already knows a better answer than the model will
+        # invent.
+        spec = TOOLS_BY_NAME["plan_flight"].parameters["altitude_ft"]
+        self.assertFalse(_is_exposed(spec))
+        self.assertNotIn("enum", spec)
 
     def test_plan_flight_still_exposes_what_the_model_needs(self):
         params = TOOLS_BY_NAME["plan_flight"].parameters

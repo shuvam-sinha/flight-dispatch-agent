@@ -573,6 +573,27 @@ class TestCheckAirspace(unittest.TestCase):
         self.assertGreater(result["active_volumes_in_region"], 0)
         self.assertIn("direct_course_crossings", result)
 
+    def test_summary_names_the_altitude_it_used(self):
+        # Airspace is altitude-banded, so a count means nothing without
+        # the altitude it was computed at -- and a wrong altitude here
+        # would be silently wrong rather than an error.
+        result = dispatch(
+            "check_airspace",
+            {"origin": "KLAX", "dest": "KSLC", "altitude_ft": "10000"},
+        )
+        self.assertIn("10,000 ft", result["summary"])
+
+    def test_altitude_changes_the_summary(self):
+        low = dispatch(
+            "check_airspace",
+            {"origin": "KLAX", "dest": "KSLC", "altitude_ft": "10000"},
+        )
+        high = dispatch(
+            "check_airspace",
+            {"origin": "KLAX", "dest": "KSLC", "altitude_ft": "39000"},
+        )
+        self.assertNotEqual(low["summary"], high["summary"])
+
     def test_altitude_changes_what_is_active(self):
         low = dispatch("check_airspace", {"origin": "KLAX", "dest": "KSLC", "altitude_ft": 5000})
         high = dispatch("check_airspace", {"origin": "KLAX", "dest": "KSLC", "altitude_ft": 41000})

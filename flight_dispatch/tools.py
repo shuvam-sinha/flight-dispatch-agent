@@ -983,7 +983,20 @@ def check_airspace(
         dest_airport.lat, dest_airport.lon,
     )
 
+    # Airspace is altitude-banded -- 501 volumes are active at 8,000 ft
+    # and 235 at 41,000 -- so an answer is only meaningful alongside the
+    # altitude it was computed for. This tool keeps its altitude enum
+    # (unlike plan_flight, where the model set one unasked), so the
+    # altitude goes in the same sentence as the count, for the same
+    # reason it does in the wind result: a bare field is skippable, and a
+    # wrong altitude here would otherwise be silently wrong.
+    blocking = [v for v in crossings if v.is_blocking]
     return {
+        "summary": (
+            f"At {altitude:,.0f} ft, {len(index)} restricted/prohibited/warning "
+            f"areas are active near this course, and the DIRECT line crosses "
+            f"{len(blocking)} of them."
+        ),
         "route": f"{origin_airport.icao} to {dest_airport.icao}",
         "altitude_ft": altitude,
         "active_volumes_in_region": len(index),
@@ -1112,13 +1125,29 @@ TOOLS: List[ToolSpec] = [
                 "description": "Route around prohibited and restricted airspace. Default true.",
                 "required": False,
             },
+            # NO ENUM HERE, DELIBERATELY -- so this stays withheld from
+            # a backend that cannot express optionality.
+            #
+            # It briefly had one, and the enum broke a working
+            # conversation within the hour. Given "plan a flight from
+            # KJFK to KLAX in a 737" the model volunteered
+            # altitude_ft='30000' -- nobody asked, and a 737-800 cruises
+            # at 35,000. Then "what about in a 172?" carried the 30,000
+            # forward into an aircraft with a 14,000 ft service ceiling,
+            # and the plan was refused outright. Before the enum existed
+            # the model could not set it and both flights planned fine.
+            #
+            # The distinction that matters: expose an altitude where the
+            # altitude IS the question, as in get_winds_aloft, where wind
+            # without one is meaningless. Withhold it where the aircraft
+            # already knows its own answer. A profile's cruise altitude
+            # is a better number than any the model will invent.
             "altitude_ft": {
-                "type": "string",
+                "type": "number",
                 "description": (
-                    "Cruise altitude in feet. Omit to use the aircraft's own "
-                    "normal cruise altitude, which is usually right."
+                    "Cruise altitude in feet. Defaults to the aircraft's own "
+                    "normal cruise altitude."
                 ),
-                "enum": list(ALTITUDE_CHOICES),
                 "required": False,
             },
             "payload_lb": {

@@ -101,7 +101,7 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
 
 ```bash
-python -m unittest discover tests      # 369 tests
+python -m unittest discover tests      # 378 tests
 ```
 
 ## Layout
@@ -549,6 +549,27 @@ Same principle as the airspace fix: a result that states what it is cannot be
 relabelled. The compass point is there for a related reason — the model rendered
 239° as "from the northeast", which is the opposite side of the compass.
 
+**Then the same enum broke `plan_flight` within the hour.** Given *"plan a flight
+from KJFK to KLAX in a 737"*, the model volunteered `altitude_ft='30000'` — which
+nobody asked for, and a 737-800 cruises at 35,000. The follow-up *"what about in
+a 172?"* carried that 30,000 into an aircraft with a **14,000 ft service
+ceiling**, and the plan was refused outright. Before the enum existed, the model
+could not set the parameter and both flights planned fine.
+
+So the rule is narrower than "expose it": **expose an altitude where the altitude
+is the question, and withhold it where the aircraft already knows the answer.**
+Wind without an altitude is meaningless, so `get_winds_aloft` keeps its enum.
+An aircraft profile's own cruise altitude is better than anything the model will
+invent, so `plan_flight` goes back to withheld. `check_airspace` keeps the enum —
+altitude is a genuine query dimension there — but its result now names the
+altitude in the same sentence as the count, because a wrong altitude there fails
+*silently* rather than erroring.
+
+Worth noting what went right: the tool returned `"cannot cruise at 30,000 ft;
+its service ceiling is 14,000 ft"` as **data**, and the model explained the
+problem and offered alternatives instead of crashing. That is the errors-as-data
+design doing its job.
+
 **A wind fetch failure destroyed the whole plan.** Now the route is replanned in
 still air and returned with a `wind_note` saying so. A degraded answer beats no
 answer.
@@ -592,4 +613,4 @@ larger-context model drops in.
 - Oceanic routing measured before and after the grid on five routes, including
   two overland controls that must *not* change
 - The agent loop tested against a `ScriptedBackend` — no model, no network
-- **369 unit tests**
+- **378 unit tests**
