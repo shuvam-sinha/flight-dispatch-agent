@@ -25,6 +25,7 @@ information.
 """
 
 import time
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -60,8 +61,10 @@ class OpenMeteoWindSource:
     """Fetches winds aloft from Open-Meteo, with snapping and caching.
 
     Args:
-        forecast_hour: Which hour of the forecast to use, counting from
-            the start of the current model run. 0 is roughly now.
+        forecast_hour: Index into the returned hourly series. Leave as
+            None to use the current UTC hour, which is what a flight
+            being planned now should see. Set an integer to pin a
+            specific hour, which is what the tests do.
         snap_deg: Grid resolution for coordinate rounding.
         session: Optional `requests.Session` for connection reuse.
         offline_ok: If True, a network failure yields calm air instead of
@@ -72,7 +75,7 @@ class OpenMeteoWindSource:
 
     def __init__(
         self,
-        forecast_hour: int = 0,
+        forecast_hour: Optional[int] = None,
         snap_deg: float = DEFAULT_SNAP_DEG,
         session: Optional[requests.Session] = None,
         offline_ok: bool = False,
@@ -233,6 +236,37 @@ class OpenMeteoWindSource:
         self.degraded = True
         return None
 
+    def _forecast_index(self, hourly: dict) -> int:
+        """Which hour of the returned series to read.
+
+        THE BUG THIS FIXES. `forecast_hour=0` was documented as "roughly
+        now", and it is not. Open-Meteo's hourly series starts at 00:00
+        UTC of the current day, so index 0 is midnight -- correct at
+        00:30 UTC and twenty-three hours stale by late evening. The winds
+        were genuinely live data from the current model run, read at the
+        wrong hour of it.
+
+        The response carries its own timestamps, so the honest thing is
+        to look them up rather than assume an offset. An explicit
+        `forecast_hour` still wins, and is now what it says it is: an
+        offset from the start of the series.
+        """
+        if self.forecast_hour is not None:
+            return self.forecast_hour
+
+        times = hourly.get("time") or []
+        if not times:
+            return 0
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00")
+        try:
+            return times.index(now)
+        except ValueError:
+            # Series does not cover this hour -- fall back to its start
+            # rather than guessing an offset into a series of unknown
+            # origin.
+            return 0
+
     def _parse_entry(self, entry: dict, level: int) -> Optional[Wind]:
         """Turn one Open-Meteo response object into a Wind."""
         hourly = entry.get("hourly")
@@ -243,7 +277,7 @@ class OpenMeteoWindSource:
         directions = hourly.get(f"wind_direction_{level}hPa") or []
         temperatures = hourly.get(f"temperature_{level}hPa") or []
 
-        index = min(self.forecast_hour, len(speeds) - 1)
+        index = min(self._forecast_index(hourly), len(speeds) - 1)
         if index < 0 or index >= len(directions):
             return None
 

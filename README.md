@@ -101,7 +101,7 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
 
 ```bash
-python -m unittest discover tests      # 303 tests
+python -m unittest discover tests      # 341 tests
 ```
 
 ## Layout
@@ -122,6 +122,7 @@ cost.py         distance → time, via the wind triangle
 wind_openmeteo.py   live gridded forecasts, batched and cached
 airspace.py     FAA volumes, STRtree-indexed; blocking edges cost infinity
 aircraft.py     47 performance profiles
+phases.py       climb / cruise / descent split
 route.py        plan_route() — ties the above into a RoutePlan
   ↓
 tools.py        the five tools, as ToolSpecs with English descriptions
@@ -297,6 +298,56 @@ ICAO code" is an instruction to a reader, and it changed behaviour more than any
 schema change did. Getting a tool used correctly turned out to be a writing
 problem as much as an engineering one.
 
+### Why flight time is not distance over cruise speed
+
+A flight has three phases, and only the middle one is flown at cruise speed:
+
+```
+ft
+|          ______________________________
+|         /                              \
+|        /            cruise              \
+|       /                                  \
+|      / climb                      descent \
++-----+------------------------------------- +-----> nm
+   origin                                  destination
+```
+
+`phases.py` subtracts the climb and descent distances from the route and flies
+the remainder at cruise. KORD→KMIA in a 777-300ER went from 2h07m to 2h18m, and
+fuel from 7,063 to 7,516 gallons — because a jet burns about 1.6× cruise flow
+climbing and a third of it descending, which a single flat burn rate misses in
+both directions.
+
+Two decisions worth noting.
+
+**It runs after the search, not inside the cost function.** Climb and descent
+depend on the route's total length and the two field elevations — not on which
+waypoints A\* picks. They are identical for every candidate path, so they cannot
+change which route wins. Folding them into the edge cost would have slowed the
+search down to compute a constant.
+
+**Short flights level off lower.** A 777 cannot reach FL370 in 150 nm and still
+come down, and naively subtracting both phases yields a negative cruise leg and
+a flight that lands before it departs. Instead the aircraft levels off at the
+altitude where climb distance plus descent distance exactly equals the route.
+Both are linear in height, so it inverts directly rather than needing a search.
+KORD→KMDW, 13 nm, tops out at 3,000 ft — which is what actually happens.
+
+Climb and descent rates are per *category*, not per type. Real per-type climb
+schedules live in manufacturer performance manuals, which are not public data,
+and inventing 47 sets of them would be dressing a guess up as a specification.
+Speeds are fractions of each aircraft's own cruise TAS, so a Cessna's climb
+speed stays sensible for a Cessna.
+
+Fixing this also exposed a smaller bug: the CLI compared average ground speed
+against cruise TAS to report net head- or tailwind. Once climb and descent were
+in the average, every flight reported a headwind. The comparison now uses the
+cruise segment, which is the part the wind acted on.
+
+Remaining gap to a published schedule is taxi and padding. ETE is airborne time
+and is labelled as such.
+
 ### Why the routing grid exists
 
 Navaids are radio transmitters on the ground, so coverage ends where the ground
@@ -427,6 +478,13 @@ nowhere to land, and the oceanic waypoints already record exactly that. Overland
 shortfalls suggest fuel stops; oceanic ones say the aircraft cannot fly the
 route.
 
+**Live winds were read at the wrong hour.** `forecast_hour=0` was documented as
+"roughly now." Open-Meteo's hourly series starts at 00:00 UTC of the current
+day, so index 0 is midnight — accurate at 00:30 UTC and twenty-three hours stale
+by late evening. The data was genuinely live, from the current model run; it was
+being read at the wrong point in it. The response carries its own timestamps, so
+the index is now looked up rather than assumed.
+
 **A wind fetch failure destroyed the whole plan.** Now the route is replanned in
 still air and returned with a `wind_note` saying so. A degraded answer beats no
 answer.
@@ -470,4 +528,4 @@ larger-context model drops in.
 - Oceanic routing measured before and after the grid on five routes, including
   two overland controls that must *not* change
 - The agent loop tested against a `ScriptedBackend` — no model, no network
-- **303 unit tests**
+- **341 unit tests**

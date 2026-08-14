@@ -670,7 +670,36 @@ def plan_flight(
     result["ete"] = f"{whole_hours}h{minutes:02d}m"
     result["ete_hours"] = round(hours_en_route, 2)
     result["average_ground_speed_kt"] = round(ground_speed)
-    result["fuel_required_gal"] = round(profile.fuel_required_gal(hours_en_route), 1)
+    result["fuel_required_gal"] = round(
+        plan.fuel_required_gal
+        if plan.fuel_required_gal is not None
+        else profile.fuel_required_gal(hours_en_route),
+        1,
+    )
+
+    # One line rather than nine fields. The three phases are worth
+    # reporting -- they are why the estimate is no longer distance over
+    # cruise speed -- but a model with a 4,096-token context does not
+    # need nine numbers to say "twenty minutes up, twenty down".
+    if plan.phases is not None:
+        phases = plan.phases
+        result["flight_profile"] = (
+            f"climb {phases.climb_time_hours * 60:.0f} min over "
+            f"{phases.climb_distance_nm:.0f} nm, cruise "
+            f"{phases.cruise_distance_nm:.0f} nm at "
+            f"{phases.cruise_altitude_ft:,.0f} ft, descent "
+            f"{phases.descent_time_hours * 60:.0f} min over "
+            f"{phases.descent_distance_nm:.0f} nm."
+        )
+        if not phases.reached_planned_altitude:
+            result["altitude_note"] = (
+                f"Too short to reach the planned cruise level -- the flight "
+                f"tops out around {phases.cruise_altitude_ft:,.0f} ft."
+            )
+        result["ete_note"] = (
+            "ETE is airborne time from takeoff to landing. It excludes taxi, "
+            "so it reads lower than a published schedule."
+        )
 
     endurance = profile.endurance_hours(payload)
     result["within_aircraft_range"] = hours_en_route <= endurance

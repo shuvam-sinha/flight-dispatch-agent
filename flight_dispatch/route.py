@@ -27,6 +27,7 @@ from .geo import cross_and_along_track_nm, haversine_nm
 from .graph import DEFAULT_MIN_NEIGHBORS, DEFAULT_RADIUS_NM, WaypointGraph, build_mesh
 from .grid import count_grid_points, waypoints_for_route
 from .models import Airport, Navaid, Waypoint
+from .phases import FlightPhases, flight_phases
 from .search import a_star
 from .wind import WindSource
 
@@ -68,11 +69,23 @@ class RoutePlan:
     # than charted navaids. None when the grid was not used.
     grid_waypoints_used: Optional[int] = None
 
+    # The climb/cruise/descent split. Present whenever an aircraft was
+    # given; `ete_hours` is this profile's total when it is.
+    phases: Optional[FlightPhases] = None
+
     @property
     def fuel_required_gal(self) -> Optional[float]:
-        """Fuel for the planned time, including reserve."""
+        """Fuel for the planned flight, including reserve.
+
+        Per phase when the profile is available: a jet burns about 1.6x
+        cruise flow climbing and a third of it descending, so billing the
+        whole flight at cruise flow overstates short sectors and
+        understates the climb.
+        """
         if self.aircraft is None or self.ete_hours is None:
             return None
+        if self.phases is not None:
+            return self.phases.total_fuel_gal + self.aircraft.reserve_gal
         return self.aircraft.fuel_required_gal(self.ete_hours)
 
     @property
@@ -315,15 +328,51 @@ def plan_route(
             )
         )
 
+    path_nodes = [graph.nodes[i] for i in result.path]
+    route_nm = sum(
+        haversine_nm(a.lat, a.lon, b.lat, b.lon)
+        for a, b in zip(path_nodes, path_nodes[1:])
+    )
+
+    # Split the flight into climb, cruise and descent. Everything above
+    # produced CRUISE time: A* costs an edge at cruise speed, because
+    # that is the speed the route is flown at between top of climb and
+    # top of descent. The ends are slower, and until now they were billed
+    # at cruise speed too.
+    #
+    # This is applied after the search rather than inside the cost
+    # function on purpose. Climb and descent depend on the route's total
+    # length and on the two field elevations -- not on which waypoints
+    # are chosen -- so they are the same for every candidate path and
+    # cannot change which route A* prefers. Folding them into the edge
+    # cost would slow the search down to compute a constant.
+    phases = None
+    if aircraft is not None:
+        cruise_ground_speed = (
+            route_nm / total_hours
+            if total_hours
+            else aircraft.cruise_tas_kt
+        )
+        phases = flight_phases(
+            aircraft,
+            route_distance_nm=route_nm,
+            cruise_ground_speed_kt=cruise_ground_speed,
+            origin_elevation_ft=origin.elevation_ft or 0.0,
+            dest_elevation_ft=dest.elevation_ft or 0.0,
+            cruise_altitude_ft=altitude_ft,
+        )
+        total_hours = phases.total_time_hours
+
     return RoutePlan(
         origin=origin,
         dest=dest,
-        waypoints=[graph.nodes[i] for i in result.path],
+        waypoints=path_nodes,
         graph_nodes=graph.node_count,
         graph_edges=graph.edge_count,
         nodes_expanded=result.nodes_expanded,
         aircraft=aircraft,
         ete_hours=total_hours,
+        phases=phases,
         airspace_avoided=airspace_avoided,
         grid_waypoints_used=(
             count_grid_points([graph.nodes[i] for i in result.path])
