@@ -66,6 +66,12 @@ class Airport:
     iata_code: str = ""           # SFO, LAX -- only commercial fields have one
     municipality: str = ""        # the city, which is what users usually type
 
+    # Alternate names from OurAirports' `keywords` column: local-language
+    # forms ("Londres" for Heathrow, "Ciudad de Mexico"), former names,
+    # and IATA metropolitan area codes (LON, NYC, CHI). Searched but not
+    # ranked on -- it is a synonym list, not a significance signal.
+    keywords: str = ""
+
     @property
     def is_major(self) -> bool:
         """A rough "would a passenger have heard of it" test."""

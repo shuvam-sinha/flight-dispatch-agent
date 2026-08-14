@@ -101,7 +101,7 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
 
 ```bash
-python -m unittest discover tests      # 341 tests
+python -m unittest discover tests      # 350 tests
 ```
 
 ## Layout
@@ -429,6 +429,34 @@ real significance signals: airport type, scheduled service, IATA code,
 municipality match, then longest runway (which meant finally opening the
 `runways.csv` that had been sitting in the data directory since CP1).
 
+**The size tiebreaker measured the wrong thing.** Among airports tied on type,
+scheduled service, IATA code and city, longest-single-runway decided — and it
+loses to anywhere that built one long strip and little else. Dubai
+International, ~90 million passengers a year, ranked below Al Maktoum, which is
+nearly empty with a runway 174 ft longer. Tokyo Haneda lost to Narita the same
+way. Total runway area — every runway, times its width, excluding closed ones —
+tracks how much traffic an airport can handle. On fifteen multi-airport cities:
+longest runway 12 correct, total area 14.
+
+**Accents.** `_normalise` stripped punctuation but not diacritics, so
+`Sao Paulo` never matched Guarulhos' municipality `São Paulo` and fell through
+to a hotel helipad that spells it without one. NFKD decomposition splits an
+accented character into base letter plus combining mark; dropping the marks
+leaves the base letters. Zürich, Málaga and Köln were the same bug.
+
+**`keywords` was never read.** OurAirports keeps alternate names there —
+`Londres` for Heathrow, `Ciudad de México` for Benito Juárez, plus IATA
+metropolitan area codes (`LON`, `NYC`, `CHI`). Adding it to the search text
+costs nothing and makes local-language queries work.
+
+Across 45 major world cities the ranker now returns the expected airport 44
+times. The exception is **Mexico City**: Felipe Ángeles is a converted air force
+base with four runways and 8.9M sq ft of pavement against Benito Juárez's 3.8M —
+more concrete, almost no traffic. No runway-derived metric separates them and
+this dataset carries no passenger figures, so it is a documented miss with a
+test pinning the current behaviour. Naming the airport (`Benito Juarez`, `MEX`,
+`AICM`, `Ciudad de Mexico`) reaches it correctly.
+
 **`find_airport("New York JFK")` found nothing at all** — the phrase is a
 substring of no field, because the city and the code live in different columns.
 Fixing it exposed a family of related misses, and the search now tries, in
@@ -528,4 +556,4 @@ larger-context model drops in.
 - Oceanic routing measured before and after the grid on five routes, including
   two overland controls that must *not* change
 - The agent loop tested against a `ScriptedBackend` — no model, no network
-- **341 unit tests**
+- **350 unit tests**

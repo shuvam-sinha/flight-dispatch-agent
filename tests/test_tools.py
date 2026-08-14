@@ -168,6 +168,70 @@ class TestFindAirportQueryForms(unittest.TestCase):
         # The relaxations must not make everything match something.
         self.assertFalse(dispatch("find_airport", {"query": "asdfghjkl"})["found"])
 
+    def test_accents_are_ignored(self):
+        # Guarulhos' municipality is "Sao Paulo" with a tilde, so an
+        # unaccented search matched nothing there and fell through to a
+        # hotel helipad that spells it without one.
+        self.assertEqual(self.first("Sao Paulo"), "SBGR")
+        self.assertEqual(self.first("Sao Paulo"), self.first("São Paulo"))
+        self.assertEqual(self.first("Zurich"), "LSZH")
+        self.assertEqual(self.first("Malaga"), "LEMG")
+
+    def test_alternate_names_from_keywords(self):
+        # OurAirports keeps local-language and former names in
+        # `keywords`, which nothing used to read.
+        self.assertEqual(self.first("Londres"), "EGLL")
+        self.assertEqual(self.first("Ciudad de Mexico"), "MMMX")
+
+
+class TestCityNamePicksTheMainAirport(unittest.TestCase):
+    """A city name should resolve to the airport people mean by it.
+
+    These are the cases the ranker exists for, and several of them are
+    ones it previously got wrong.
+    """
+
+    EXPECTED = {
+        "Chicago": "KORD",
+        "New York": "KJFK",
+        "Los Angeles": "KLAX",
+        "Houston": "KIAH",
+        "San Francisco": "KSFO",  # was a Mexican airstrip
+        "London": "EGLL",         # was East London, South Africa
+        "Paris": "LFPG",
+        "Tokyo": "RJTT",          # was Narita, on longest-runway
+        "Dubai": "OMDB",          # was Al Maktoum, on longest-runway
+        "Sao Paulo": "SBGR",      # was a hotel helipad, on the accent
+        "Rome": "LIRF",
+        "Seoul": "RKSI",
+        "Istanbul": "LTFM",
+        "Milan": "LIMC",
+        "Osaka": "RJBB",
+        "Toronto": "CYYZ",
+        "Sydney": "YSSY",
+        "Madrid": "LEMD",
+    }
+
+    def test_each_city_resolves_to_its_main_airport(self):
+        for city, icao in self.EXPECTED.items():
+            result = dispatch("find_airport", {"query": city})
+            first = result.get("icao") or result["matches"][0]["icao"]
+            self.assertEqual(first, icao, f"{city} -> {first}")
+
+    def test_mexico_city_is_a_known_miss(self):
+        # Documented rather than hidden. Felipe Angeles is a converted
+        # air force base with more pavement than Benito Juarez and almost
+        # no traffic, and this dataset carries no traffic figures. If a
+        # future change fixes it, this test should be the one that fails.
+        result = dispatch("find_airport", {"query": "Mexico City"})
+        self.assertEqual(result["matches"][0]["icao"], "MMSM")
+
+    def test_naming_the_airport_reaches_it_anyway(self):
+        for query in ("Benito Juarez", "MEX", "AICM", "Ciudad de Mexico"):
+            result = dispatch("find_airport", {"query": query})
+            first = result.get("icao") or result["matches"][0]["icao"]
+            self.assertEqual(first, "MMMX", query)
+
 
 class TestListAircraft(unittest.TestCase):
     def test_lists_everything_by_default(self):
@@ -458,13 +522,13 @@ class TestMatchRanking(unittest.TestCase):
         self.assertLess(_match_rank(real, "san francisco"),
                         _match_rank(airstrip, "san francisco"))
 
-    def test_runway_length_breaks_ties_between_major_airports(self):
+    def test_runway_area_breaks_ties_between_major_airports(self):
         from flight_dispatch.models import Airport
         from flight_dispatch.tools import _match_rank
 
         # Both large, scheduled, IATA-coded, both match "london".
-        # Only runway length separates them -- and "East London Airport"
-        # is the shorter name, so length alone got this backwards.
+        # Only runway area separates them -- and "East London Airport"
+        # is the shorter name, so name length alone got this backwards.
         heathrow = Airport(icao="EGLL", name="London Heathrow Airport",
                            lat=51.5, lon=-0.5, airport_type="large_airport",
                            scheduled_service=True, iata_code="LHR",
@@ -474,8 +538,8 @@ class TestMatchRanking(unittest.TestCase):
                               scheduled_service=True, iata_code="ELS",
                               municipality="East London")
         self.assertLess(
-            _match_rank(heathrow, "london", runway_ft=12802),
-            _match_rank(east_london, "london", runway_ft=6200),
+            _match_rank(heathrow, "london", runway_area=4_067_200),
+            _match_rank(east_london, "london", runway_area=1_170_000),
         )
 
     def test_municipality_is_searched_not_just_the_name(self):

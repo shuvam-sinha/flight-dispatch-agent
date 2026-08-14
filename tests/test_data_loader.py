@@ -114,5 +114,36 @@ class TestNavaidsInBounds(unittest.TestCase):
         self.assertEqual([n.ident for n in loose], ["EDGE"])
 
 
+class TestRunwayArea(unittest.TestCase):
+    """The size proxy behind airport ranking."""
+
+    @classmethod
+    def setUpClass(cls):
+        from flight_dispatch.data_loader import load_runway_area
+
+        cls.area = load_runway_area()
+
+    def test_major_airports_are_present(self):
+        for icao in ("KORD", "EGLL", "KJFK", "OMDB"):
+            self.assertGreater(self.area.get(icao, 0), 0, icao)
+
+    def test_a_hub_outranks_its_secondary_airport(self):
+        # The pairs that longest-single-runway got wrong.
+        self.assertGreater(self.area["OMDB"], self.area["OMDW"])  # Dubai
+        self.assertGreater(self.area["RJTT"], self.area["RJAA"])  # Tokyo
+        # And the ones it got right, which must not regress.
+        self.assertGreater(self.area["KORD"], self.area["KMDW"])  # Chicago
+        self.assertGreater(self.area["EGLL"], self.area["EGKK"])  # London
+        self.assertGreater(self.area["KJFK"], self.area["KLGA"])  # New York
+
+    def test_area_counts_every_runway_not_just_the_longest(self):
+        # O'Hare has 8 open runways to Midway's 5, and the gap should be
+        # far wider than any single-runway comparison would show.
+        self.assertGreater(self.area["KORD"], 3 * self.area["KMDW"])
+
+    def test_airports_with_no_runway_rows_are_absent(self):
+        self.assertNotIn("ZZZZ", self.area)
+
+
 if __name__ == "__main__":
     unittest.main()

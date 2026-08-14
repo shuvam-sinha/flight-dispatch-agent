@@ -41,6 +41,7 @@ Three things matter more here than in ordinary API design:
 
 import math
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -54,7 +55,7 @@ from .airspace import (
 from .data_loader import (
     MissingDataError,
     load_airports,
-    load_longest_runways,
+    load_runway_area,
     load_navaids,
     navaids_near_route,
 )
@@ -92,14 +93,14 @@ def _navaids() -> list:
 
 
 def _runways() -> dict:
-    """Longest runway per airport, for ranking name searches.
+    """Total open runway area per airport, for ranking name searches.
 
     Loaded lazily and tolerantly: ranking is a nicety, so a missing
     runways.csv degrades the ordering rather than failing the lookup.
     """
     if "runways" not in _CACHE:
         try:
-            _CACHE["runways"] = load_longest_runways()
+            _CACHE["runways"] = load_runway_area()
         except MissingDataError:
             _CACHE["runways"] = {}
     return _CACHE["runways"]
@@ -176,7 +177,7 @@ _TYPE_RANK = {
 }
 
 
-def _match_rank(airport, needle: str = "", runway_ft: int = 0) -> tuple:
+def _match_rank(airport, needle: str = "", runway_area: float = 0.0) -> tuple:
     """Sort key for name-search results: most likely answer first.
 
     THE BUG THIS REPLACES. Sorting by name length put a Mexican airstrip
@@ -197,15 +198,27 @@ def _match_rank(airport, needle: str = "", runway_ft: int = 0) -> tuple:
       MUNICIPALITY MATCH. Someone typing "San Francisco" usually means
         the airport serving that city, not one that happens to share the
         name -- so a municipality hit outranks a mere name hit.
-      LONGEST RUNWAY. The tiebreaker among airports the first four
+      RUNWAY AREA. The tiebreaker among airports the first four
         cannot separate. London Heathrow and East London (South Africa)
         are both large airports with scheduled service and IATA codes,
         and "East London Airport" is the shorter name -- so name length
-        put a South African regional airport ahead of Heathrow. Their
-        runways are 12,802 ft and ~6,200 ft.
+        put a South African regional airport ahead of Heathrow.
 
     Name length survives only as the final tiebreaker, which is all it
     was ever suited for.
+
+    WHY AREA RATHER THAN THE LONGEST RUNWAY
+    ---------------------------------------
+    Longest-single-runway came first, and it loses to any airport with
+    one long strip and little else. Dubai International -- ~90 million
+    passengers a year -- ranked below Al Maktoum, which is nearly empty
+    and has a runway 174 ft longer. Tokyo Haneda lost to Narita the same
+    way. Total area counts every runway and its width, which tracks how
+    much traffic an airport can actually handle. On fifteen
+    multi-airport cities: longest runway 12 correct, total area 14.
+
+    The fifteenth is Mexico City, and no runway metric fixes it -- see
+    `data_loader.load_runway_area`.
     """
     # `needle` arrives normalised, so the municipality is normalised too
     # -- otherwise "OHare" would never match the city text it came from.
@@ -216,7 +229,7 @@ def _match_rank(airport, needle: str = "", runway_ft: int = 0) -> tuple:
         not airport.scheduled_service,            # then commercial service
         not airport.iata_code,                    # then an IATA code
         not municipality_match,                   # then serving that city
-        -runway_ft,                               # then the bigger airport
+        -runway_area,                             # then the bigger airport
         len(airport.name),                        # then shortest name
     )
 
@@ -225,14 +238,25 @@ _SEARCH_INDEX: Optional[List] = None
 
 
 def _normalise(text: str) -> str:
-    """Lowercase and strip punctuation, so O'Hare matches OHare.
+    """Lowercase, strip accents, strip punctuation.
 
-    People type identifiers without their punctuation far more often than
-    with it, and no airport is distinguished from another by an
-    apostrophe. Both the query and the haystack go through this, so the
-    comparison is punctuation-blind on both sides.
+    Punctuation goes because people type identifiers without it far more
+    often than with it, and no airport is distinguished from another by
+    an apostrophe -- O'Hare and OHare are the same place.
+
+    Accents go for the same reason, and it was a real bug: Guarulhos'
+    municipality is "Sao Paulo" with a tilde, so a plain "Sao Paulo"
+    search matched nothing there and fell through to a hotel helipad
+    whose name happens to spell it without one. Decomposing to NFKD
+    splits an accented character into its base letter plus a combining
+    mark, and dropping the marks leaves the base letters behind.
+
+    Both the query and the haystack go through this, so the comparison is
+    blind to both on both sides.
     """
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    decomposed = unicodedata.normalize("NFKD", text.lower())
+    unaccented = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", unaccented).strip()
 
 
 def _search_index() -> List:
@@ -241,6 +265,12 @@ def _search_index() -> List:
     Every name, city, IATA and ICAO code a person might use, normalised.
     85,825 airports is enough that rebuilding this per query would show
     up in a conversation's latency.
+
+    `keywords` is included because it is where OurAirports keeps the
+    alternate names: local-language forms ("Londres" for Heathrow,
+    "Ciudad de Mexico" for Benito Juarez), former names, and IATA
+    metropolitan area codes (LON, NYC, CHI). It is searched but never
+    ranked on -- a synonym list says nothing about how big an airport is.
     """
     global _SEARCH_INDEX
     if _SEARCH_INDEX is None:
@@ -254,6 +284,7 @@ def _search_index() -> List:
                             airport.municipality,
                             airport.iata_code,
                             airport.icao,
+                            airport.keywords,
                         )
                     )
                 ),
