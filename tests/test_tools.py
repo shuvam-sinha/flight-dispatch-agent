@@ -466,6 +466,17 @@ class TestPlanFlight(unittest.TestCase):
     def test_reports_whether_wind_was_applied(self):
         self.assertFalse(self.plan()["wind_applied"])
 
+    def test_wind_is_stated_as_a_sentence(self):
+        # THE BUG THIS REPLACES. `wind_applied: true` was the only
+        # statement that live winds had been used, and the model skipped
+        # it -- described a whole plan without mentioning wind. The user
+        # asked "with wind considerations?" and the agent re-ran the
+        # identical call, because wind had been on all along. Airspace,
+        # already a sentence by then, WAS reported in that same reply.
+        text = self.plan()["wind"]
+        self.assertIn("still air", text)
+        self.assertIn("not requested", text)
+
     def test_airspace_result_is_an_unambiguous_sentence(self):
         # THE BUG THIS REPLACES. The result used to carry
         # `airspace_avoidance_applied: true` alongside
@@ -722,3 +733,52 @@ class TestMatchRanking(unittest.TestCase):
         # which city they serve.
         result = dispatch("find_airport", {"query": "Minneapolis"})
         self.assertGreater(result["match_count"], 1)
+
+
+class TestWindIsDescribed(unittest.TestCase):
+    """The wind sentence, with a stubbed plan so it does not depend on
+    today's weather or on Open-Meteo being up."""
+
+    def describe(self, ground_speed_kt, tas_kt=180.0):
+        from types import SimpleNamespace
+
+        from flight_dispatch.tools import _describe_wind
+
+        phases = SimpleNamespace(
+            cruise_distance_nm=ground_speed_kt, cruise_time_hours=1.0
+        )
+        plan = SimpleNamespace(phases=phases)
+        profile = SimpleNamespace(cruise_tas_kt=tas_kt)
+        return _describe_wind(plan, profile)
+
+    def test_names_a_tailwind(self):
+        text = self.describe(230.0)
+        self.assertIn("tailwind", text)
+        self.assertIn("50 kt", text)
+
+    def test_names_a_headwind(self):
+        text = self.describe(140.0)
+        self.assertIn("headwind", text)
+        self.assertIn("40 kt", text)
+
+    def test_a_trivial_difference_is_not_called_a_wind(self):
+        # Reporting "a net tailwind of 1 kt" is noise dressed as insight.
+        self.assertIn("still air", self.describe(182.0))
+
+    def test_says_the_wind_was_live(self):
+        self.assertIn("Live winds aloft applied", self.describe(230.0))
+
+    def test_compares_cruise_not_the_whole_flight(self):
+        # Climb and descent are flown below cruise speed by design, so an
+        # average over the whole flight makes every flight look like a
+        # headwind -- the trap the CLI fell into when phases landed.
+        self.assertIn("still air", self.describe(180.0))
+
+    def test_falls_back_when_there_is_no_phase_profile(self):
+        from types import SimpleNamespace
+
+        from flight_dispatch.tools import _describe_wind
+
+        plan = SimpleNamespace(phases=None)
+        profile = SimpleNamespace(cruise_tas_kt=180.0)
+        self.assertIn("Live winds aloft applied", _describe_wind(plan, profile))

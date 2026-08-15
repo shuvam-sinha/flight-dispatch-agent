@@ -347,7 +347,9 @@ def build_wind_source(spec: Optional[str]):
         # live data is asked for.
         from flight_dispatch.wind_openmeteo import OpenMeteoWindSource
 
-        return OpenMeteoWindSource()
+        # Routing never reads the temperature, and requesting it is a
+        # third of the cost of every call -- see wind_openmeteo.
+        return OpenMeteoWindSource(want_temperature=False)
 
     try:
         direction, speed = spec.split("/")

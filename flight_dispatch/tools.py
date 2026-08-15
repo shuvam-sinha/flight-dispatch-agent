@@ -617,7 +617,10 @@ def plan_flight(
         from .wind_openmeteo import OpenMeteoWindSource, WindDataError
 
         try:
-            wind_source = OpenMeteoWindSource()
+            # No temperature: routing uses wind alone, and asking for it
+            # costs a third of every request against a quota that a
+            # transcontinental mesh can exhaust on its own.
+            wind_source = OpenMeteoWindSource(want_temperature=False)
         except WindDataError as exc:
             # Degrade rather than fail: a route without wind is still
             # useful, and the model can tell the user why.
@@ -688,8 +691,28 @@ def plan_flight(
         "wind_applied": use_wind,
     }
 
+    # A SENTENCE, NOT A FLAG.
+    #
+    # `wind_applied: true` was the only statement that live winds had
+    # been used, and it was skipped exactly as `altitude_ft` and the
+    # airspace count were before it. In a real session the model
+    # described a plan without mentioning wind at all; the user then
+    # asked "with wind considerations?", and the agent re-ran the
+    # identical call -- wind had been on the whole time. The flag was
+    # never wrong, it was just invisible among other bare fields.
+    #
+    # Airspace, already converted, was reported in that same reply. That
+    # is the argument in one transcript: the sentence gets read and the
+    # boolean does not.
     if wind_note:
         result["wind_note"] = wind_note
+        result["wind"] = wind_note
+    elif use_wind:
+        result["wind"] = _describe_wind(plan, profile)
+    else:
+        result["wind"] = (
+            "Planned in still air -- wind was not requested for this plan."
+        )
 
     # The per-leg table is only included for routes short enough to be
     # worth reading. A transcontinental route has 21 waypoints, and the
@@ -860,6 +883,35 @@ def plan_flight(
         )
 
     return result
+
+
+def _describe_wind(plan, profile) -> str:
+    """Say what the wind did to the flight, not merely that it was used.
+
+    The comparison is made in the CRUISE, not across the whole flight.
+    Climb and descent are flown below cruise speed by design, so once
+    they are in the average every flight looks like it fought a headwind
+    -- the same trap the CLI fell into when the phase model landed.
+    """
+    phases = plan.phases
+    if phases is None or not phases.cruise_time_hours:
+        return "Live winds aloft applied."
+
+    cruise_ground_speed = phases.cruise_distance_nm / phases.cruise_time_hours
+    delta = cruise_ground_speed - profile.cruise_tas_kt
+
+    if abs(delta) < 5:
+        effect = "close to still air overall"
+    elif delta > 0:
+        effect = f"a net tailwind of {delta:.0f} kt"
+    else:
+        effect = f"a net headwind of {-delta:.0f} kt"
+
+    return (
+        f"Live winds aloft applied. Cruise ground speed "
+        f"{cruise_ground_speed:.0f} kt against {profile.cruise_tas_kt:.0f} kt "
+        f"true airspeed -- {effect}."
+    )
 
 
 def _describe_waypoints(plan) -> List[Dict[str, Any]]:
@@ -1073,7 +1125,9 @@ TOOLS: List[ToolSpec] = [
             "find_airport first if you only have a name. Winds aloft and "
             "restricted-airspace avoidance are applied internally by default, "
             "so you do not need to call get_winds_aloft or check_airspace "
-            "beforehand."
+            "beforehand -- ALWAYS repeat the `wind` and `restricted_airspace` "
+            "lines from the result, so the user can see what was applied "
+            "without asking for it again."
         ),
         parameters={
             "origin": {

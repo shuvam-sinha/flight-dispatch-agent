@@ -52,6 +52,17 @@ REQUEST_TIMEOUT_S = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_S = 2.0
 
+# Open-Meteo's per-minute allowance resets on a wall-clock minute, and it
+# sends no Retry-After header -- it says so in the response body instead.
+# Backing off 2s then 4s could never clear a minute-long window, which is
+# why every long route used to give up and plan in still air. A little
+# over the minute, to land safely past the boundary.
+MINUTELY_RESET_S = 62.0
+
+# Never sleep longer than this on one attempt, however the wait was
+# derived. A flight plan that takes minutes to return is its own failure.
+MAX_RETRY_WAIT_S = 65.0
+
 
 class WindDataError(RuntimeError):
     """Raised when wind data cannot be fetched or parsed."""
@@ -61,6 +72,10 @@ class OpenMeteoWindSource:
     """Fetches winds aloft from Open-Meteo, with snapping and caching.
 
     Args:
+        want_temperature: Whether to request temperature alongside wind.
+            Routing does not use it, and it is a third of the cost of
+            every request -- see `_fetch_batch`. Left on for single-point
+            lookups, where it is part of the answer.
         forecast_hour: Index into the returned hourly series. Leave as
             None to use the current UTC hour, which is what a flight
             being planned now should see. Set an integer to pin a
@@ -75,11 +90,13 @@ class OpenMeteoWindSource:
 
     def __init__(
         self,
+        want_temperature: bool = True,
         forecast_hour: Optional[int] = None,
         snap_deg: float = DEFAULT_SNAP_DEG,
         session: Optional[requests.Session] = None,
         offline_ok: bool = False,
     ):
+        self.want_temperature = want_temperature
         self.forecast_hour = forecast_hour
         self.snap_deg = snap_deg
         self.session = session or requests.Session()
@@ -94,6 +111,7 @@ class OpenMeteoWindSource:
         self.points_fetched = 0
         self.degraded = False  # True if any fetch failed and we fell back
         self.rate_limit_hits = 0
+        self.service_busy_hits = 0
 
     # -- public interface ------------------------------------------------
 
@@ -147,21 +165,43 @@ class OpenMeteoWindSource:
     def _fetch_batch(
         self, points: Sequence[Tuple[float, float]], level: int
     ) -> None:
-        """Fetch one batch and populate the cache."""
+        """Fetch one batch and populate the cache.
+
+        ASK FOR LESS, NOT LESS OFTEN.
+
+        Open-Meteo does not meter requests, it meters work: a call costs
+        roughly locations x variables x forecast days. Batching 50
+        coordinates was a large speed win and quietly made each request
+        fifty times as expensive. At three variables and two days that is
+        300 units per request, and a KJFK-KLAX mesh needs 20 of them --
+        about 1,000 units against a 600-per-minute allowance. A single
+        transcontinental plan exceeded the quota by itself, every long
+        route came back "winds unavailable", and the routes where wind
+        matters most were the ones that never got any.
+
+        Two economies, no loss of information:
+
+          FORECAST DAYS 2 -> 1. Only one hour is ever read, and it is
+            today's. The second day was fetched and discarded.
+          TEMPERATURE ONLY WHEN ASKED. Routing uses wind alone; the
+            temperature is for display in single-point lookups. Bulk
+            prefetches for a mesh do not need it.
+
+        Together about 3x cheaper, which puts a transcontinental plan
+        back inside the allowance.
+        """
         if not points:
             return
+
+        variables = [f"wind_speed_{level}hPa", f"wind_direction_{level}hPa"]
+        if self.want_temperature:
+            variables.append(f"temperature_{level}hPa")
 
         params = {
             "latitude": ",".join(f"{lat:.4f}" for lat, _ in points),
             "longitude": ",".join(f"{lon:.4f}" for _, lon in points),
-            "hourly": ",".join(
-                (
-                    f"wind_speed_{level}hPa",
-                    f"wind_direction_{level}hPa",
-                    f"temperature_{level}hPa",
-                )
-            ),
-            "forecast_days": 2,
+            "hourly": ",".join(variables),
+            "forecast_days": 1,
         }
 
         payload = self._get_with_retry(params)
@@ -179,6 +219,36 @@ class OpenMeteoWindSource:
             if wind is not None:
                 self._cache[(lat, lon, level)] = wind
                 self.points_fetched += 1
+
+    def _retry_wait(self, response, attempt: int) -> float:
+        """How long to wait after a 429.
+
+        THE BUG THIS FIXES. The backoff was 2s, then 4s, then give up --
+        six seconds in total, against a limit the server describes as
+        "Minutely API request limit exceeded. Please try again in one
+        minute." The retry could not possibly succeed, so every long
+        route fell back to still air.
+
+        Open-Meteo sends no `Retry-After` header, so the wait has to come
+        from the message. When the server says the window is a minute,
+        wait for the minute.
+        """
+        header = response.headers.get("Retry-After")
+        if header:
+            try:
+                return min(float(header), MAX_RETRY_WAIT_S)
+            except ValueError:
+                pass
+
+        try:
+            reason = response.json().get("reason", "")
+        except ValueError:
+            reason = response.text or ""
+
+        if "minute" in reason.lower():
+            return MINUTELY_RESET_S
+
+        return min(RETRY_BACKOFF_S * (2**attempt), MAX_RETRY_WAIT_S)
 
     def _get_with_retry(self, params: dict) -> Optional[dict]:
         """Fetch one batch, retrying rate limits with backoff.
@@ -200,18 +270,21 @@ class OpenMeteoWindSource:
                 response = self.session.get(
                     API_URL, params=params, timeout=REQUEST_TIMEOUT_S
                 )
-                if response.status_code == 429:
-                    last_error = requests.HTTPError("429 Too Many Requests")
-                    self.rate_limit_hits += 1
+                # 429 is our fault (too much asked for); 503 is theirs
+                # ("The service is overloaded"). Both are transient and
+                # both deserve a wait rather than losing the flight plan,
+                # but only 429 gets the minute-long backoff -- an
+                # overloaded server usually recovers in seconds.
+                if response.status_code in (429, 503):
+                    last_error = requests.HTTPError(
+                        f"{response.status_code} from Open-Meteo"
+                    )
+                    if response.status_code == 429:
+                        self.rate_limit_hits += 1
+                    else:
+                        self.service_busy_hits += 1
                     if attempt < MAX_RETRIES - 1:
-                        # Honour Retry-After when the server supplies it,
-                        # otherwise back off exponentially.
-                        wait = float(
-                            response.headers.get(
-                                "Retry-After", RETRY_BACKOFF_S * (2**attempt)
-                            )
-                        )
-                        time.sleep(min(wait, 30.0))
+                        time.sleep(self._retry_wait(response, attempt))
                         continue
                     break
 

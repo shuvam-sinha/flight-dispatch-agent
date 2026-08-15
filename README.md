@@ -101,7 +101,7 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
 
 ```bash
-python -m unittest discover tests      # 378 tests
+python -m unittest discover tests      # 396 tests
 ```
 
 ## Layout
@@ -613,4 +613,4 @@ larger-context model drops in.
 - Oceanic routing measured before and after the grid on five routes, including
   two overland controls that must *not* change
 - The agent loop tested against a `ScriptedBackend` — no model, no network
-- **378 unit tests**
+- **396 unit tests**
