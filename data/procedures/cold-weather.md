@@ -1,5 +1,6 @@
 # Cold weather operations
 category: operations
+applies_when: freezing
 
 Contamination on a wing is not acceptable in any quantity. Frost, snow or
 ice disrupts airflow enough to prevent a normal takeoff, and the clean

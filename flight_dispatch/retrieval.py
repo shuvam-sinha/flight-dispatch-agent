@@ -79,6 +79,8 @@ class Chunk:
         title: Human-readable heading.
         category: Loose grouping -- preflight, weather, emergency. Not
             used for ranking; useful for filtering and for display.
+        applies_when: A condition this document requires, or "" when it
+            applies to every flight. See `ProcedureIndex.search`.
         text: The body, which is what gets embedded.
     """
 
@@ -86,6 +88,7 @@ class Chunk:
     title: str
     category: str
     text: str
+    applies_when: str = ""
 
     @property
     def digest(self) -> str:
@@ -113,9 +116,11 @@ def load_corpus(directory: Path = CORPUS_DIR) -> List[Chunk]:
 
         title_match = re.search(r"^#\s+(.+)$", raw, re.MULTILINE)
         category_match = re.search(r"^category:\s*(.+)$", raw, re.MULTILINE)
+        applies_match = re.search(r"^applies_when:\s*(.+)$", raw, re.MULTILINE)
 
-        body = re.sub(r"^#\s+.+$", "", raw, count=1, flags=re.MULTILINE)
-        body = re.sub(r"^category:\s*.+$", "", body, count=1, flags=re.MULTILINE)
+        body = raw
+        for pattern in (r"^#\s+.+$", r"^category:\s*.+$", r"^applies_when:\s*.+$"):
+            body = re.sub(pattern, "", body, count=1, flags=re.MULTILINE)
 
         chunks.append(
             Chunk(
@@ -123,6 +128,9 @@ def load_corpus(directory: Path = CORPUS_DIR) -> List[Chunk]:
                 title=title_match.group(1).strip() if title_match else path.stem,
                 category=(
                     category_match.group(1).strip() if category_match else "general"
+                ),
+                applies_when=(
+                    applies_match.group(1).strip() if applies_match else ""
                 ),
                 text=body.strip(),
             )
@@ -250,21 +258,56 @@ class ProcedureIndex:
         query_vector: Sequence[float],
         top_k: int = DEFAULT_TOP_K,
         min_similarity: float = MIN_SIMILARITY,
+        conditions: Optional[Sequence[str]] = None,
     ) -> List[Match]:
-        """The best-matching chunks, most similar first.
+        """The best-matching APPLICABLE chunks, most similar first.
 
-        Weak matches are dropped rather than padded out to `top_k`.
+        SIMILARITY IS NOT APPLICABILITY. Asked for a Cessna 172
+        departure, plain vector search ranked `night-flight` FIRST at
+        0.619 -- above the preflight inspection. It deserved to: it is
+        dense with light-aircraft VFR language and genuinely was the most
+        similar document. It simply did not apply, because nothing said
+        the flight was at night. The checklist told a pilot to carry a
+        flashlight and expect the black-hole illusion, possibly at noon.
+
+        The scores made the problem plain: across the light-aircraft
+        documents they ran 0.579 to 0.619, barely discriminating, because
+        they are all about light aircraft.
+
+        So a document may declare a precondition, and one whose condition
+        is not known to hold is excluded BEFORE ranking rather than left
+        to compete on similarity. Metadata filter first, vector search
+        second -- the usual shape of hybrid retrieval.
+
+        Unconditional documents -- preflight, fuel reserves, weight and
+        balance -- carry no `applies_when` and always compete.
+
+        Weak matches are then dropped rather than padded out to `top_k`.
         Every chunk returned becomes licence for the model to write about
         that subject, so a barely-related document is not a neutral
         addition -- it is an invitation to put mountain flying in the
         checklist for a flight across Kansas.
         """
+        active = set(conditions or ())
+
         scored = [
             Match(chunk=chunk, score=cosine_similarity(query_vector, vector))
             for chunk, vector in zip(self.chunks, self.vectors)
+            if not chunk.applies_when or chunk.applies_when in active
         ]
         scored.sort(key=lambda match: -match.score)
         return [match for match in scored if match.score >= min_similarity][:top_k]
+
+    def conditions_available(self) -> List[str]:
+        """Every precondition the corpus declares.
+
+        Lets a caller check that a condition it believes it is supplying
+        actually gates something -- a typo would otherwise exclude a
+        document silently and for ever.
+        """
+        return sorted(
+            {chunk.applies_when for chunk in self.chunks if chunk.applies_when}
+        )
 
     def by_id(self, chunk_id: str) -> Optional[Chunk]:
         """Look up a chunk by citation id, for verifying a citation."""

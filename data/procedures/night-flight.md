@@ -1,5 +1,6 @@
 # Night flight considerations
 category: operations
+applies_when: night
 
 Night flying is legal, routine and less forgiving. Visual references
 disappear, terrain is invisible, and an off-airport landing site cannot

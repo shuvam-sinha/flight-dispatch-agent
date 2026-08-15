@@ -1,5 +1,6 @@
 # Airframe icing
 category: weather
+applies_when: icing
 
 Structural icing needs visible moisture and a surface at or below
 freezing. Both conditions together are the trigger: cloud, rain or

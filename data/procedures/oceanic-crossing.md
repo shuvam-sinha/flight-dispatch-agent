@@ -1,5 +1,6 @@
 # Oceanic operations
 category: operations
+applies_when: overwater
 
 Oceanic airspace has no radar coverage and no ground navigation aids.
 Position is reported by the crew and separation is procedural, so

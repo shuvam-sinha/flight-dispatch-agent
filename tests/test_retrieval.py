@@ -282,18 +282,30 @@ class TestLiveRetrieval(unittest.TestCase):
     def setUpClass(cls):
         cls.index = ProcedureIndex.build()
 
-    def search(self, text):
+    def search(self, text, conditions=None):
         from flight_dispatch.retrieval import embed_texts
 
-        return self.index.search(embed_texts([text])[0])
+        return self.index.search(
+            embed_texts([text])[0], conditions=conditions or []
+        )
 
     def test_the_corpus_embeds(self):
         self.assertEqual(len(self.index), len(load_corpus()))
         self.assertGreater(len(self.index.vectors[0]), 100)
 
     def test_a_query_finds_the_obviously_right_document(self):
-        matches = self.search("flying into freezing rain and cloud, ice on the wing")
+        matches = self.search(
+            "flying into freezing rain and cloud, ice on the wing",
+            conditions=["icing"],
+        )
         self.assertIn("icing", [m.chunk.id for m in matches])
+
+    def test_the_same_query_finds_nothing_when_the_condition_is_unmet(self):
+        # Real embeddings, real corpus: the icing document is the most
+        # similar thing there is, and it is still excluded because
+        # nothing said the flight would meet icing.
+        matches = self.search("flying into freezing rain and cloud, ice on the wing")
+        self.assertNotIn("icing", [m.chunk.id for m in matches])
 
     def test_a_different_query_finds_a_different_document(self):
         matches = self.search("the engine has failed and I need to land")
@@ -314,3 +326,107 @@ class TestLiveRetrieval(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPreconditions(unittest.TestCase):
+    """THE BUG THESE COVER.
+
+    Asked for a Cessna 172 departure, plain vector search ranked
+    `night-flight` FIRST at 0.619 -- above the preflight inspection. It
+    deserved to: it is dense with light-aircraft VFR language and was
+    genuinely the most similar document. It simply did not apply, because
+    nothing said the flight was at night. The checklist told a pilot to
+    carry a flashlight and expect the black-hole illusion, possibly at
+    noon.
+
+    So similarity is filtered by applicability first.
+    """
+
+    def index(self):
+        return ProcedureIndex(
+            [
+                Chunk(id="always", title="a", category="t", text="a"),
+                Chunk(id="at-night", title="b", category="t", text="b",
+                      applies_when="night"),
+            ],
+            [[1.0, 0.0], [1.0, 0.0]],  # equally similar to anything
+        )
+
+    def test_a_conditional_chunk_is_excluded_when_unmet(self):
+        found = self.index().search([1.0, 0.0], conditions=[])
+        self.assertEqual([m.chunk.id for m in found], ["always"])
+
+    def test_a_conditional_chunk_is_included_when_met(self):
+        found = self.index().search([1.0, 0.0], conditions=["night"])
+        self.assertEqual({m.chunk.id for m in found}, {"always", "at-night"})
+
+    def test_unconditional_chunks_always_compete(self):
+        found = self.index().search([1.0, 0.0], conditions=["something-else"])
+        self.assertIn("always", [m.chunk.id for m in found])
+
+    def test_filtering_happens_before_ranking(self):
+        # Not merely reordered: an inapplicable chunk must not occupy a
+        # top_k slot that a relevant one could have used.
+        index = ProcedureIndex(
+            [
+                Chunk(id="night", title="n", category="t", text="n",
+                      applies_when="night"),
+                Chunk(id="relevant", title="r", category="t", text="r"),
+            ],
+            [[1.0, 0.0], [0.9, 0.1]],  # the conditional one scores higher
+        )
+        found = index.search([1.0, 0.0], top_k=1, conditions=[])
+        self.assertEqual([m.chunk.id for m in found], ["relevant"])
+
+    def test_the_corpus_declares_its_conditions(self):
+        conditions = ProcedureIndex(load_corpus(), [[1.0]] * len(load_corpus())
+                                    ).conditions_available()
+        self.assertIn("night", conditions)
+        self.assertIn("overwater", conditions)
+
+    def test_unconditional_documents_exist(self):
+        # If everything were conditional, a flight with no known
+        # conditions would retrieve nothing at all.
+        unconditional = [c for c in load_corpus() if not c.applies_when]
+        self.assertGreaterEqual(len(unconditional), 5)
+
+
+class TestConditionsFromFlightFacts(unittest.TestCase):
+    """Conditions are derived from real data, never assumed."""
+
+    def conditions(self, aircraft_key, origin=None, dest=None):
+        from flight_dispatch.aircraft import get_aircraft
+        from flight_dispatch.data_loader import load_airports
+        from flight_dispatch.tools import _flight_conditions
+
+        airports = load_airports()
+        return _flight_conditions(
+            get_aircraft(aircraft_key),
+            airports.get(origin) if origin else None,
+            airports.get(dest) if dest else None,
+        )
+
+    def test_a_jet_is_high_altitude(self):
+        self.assertIn("high-altitude", self.conditions("b789"))
+        self.assertNotIn("high-altitude", self.conditions("c172"))
+
+    def test_a_high_field_is_high_elevation(self):
+        self.assertIn("high-elevation", self.conditions("b738", "KDEN", "KMCI"))
+        self.assertNotIn("high-elevation", self.conditions("b738", "KJFK", "KBOS"))
+
+    def test_an_ocean_crossing_is_overwater(self):
+        self.assertIn("overwater", self.conditions("b789", "KJFK", "EGLL"))
+
+    def test_a_domestic_route_is_not_overwater(self):
+        # The first version of this test asked merely whether ANY grid
+        # point existed, and declared a flight across Wisconsin oceanic.
+        self.assertNotIn("overwater", self.conditions("sr22", "KPWK", "KMSP"))
+        self.assertNotIn("overwater", self.conditions("b738", "KJFK", "KLAX"))
+
+    def test_night_is_never_assumed(self):
+        # Nothing in the system records time of day, so the condition is
+        # never satisfied and night procedures stay out unless a caller
+        # supplies it. A checklist item that does not apply is noise a
+        # pilot has to filter, and filtering is what a checklist avoids.
+        for args in (("c172",), ("b789", "KJFK", "EGLL"), ("b738", "KDEN", "KMCI")):
+            self.assertNotIn("night", self.conditions(*args))

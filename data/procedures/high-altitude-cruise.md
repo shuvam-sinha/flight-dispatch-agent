@@ -1,5 +1,6 @@
 # High altitude cruise
 category: operations
+applies_when: high-altitude
 
 Above 10,000 ft the physiological environment becomes the limiting
 factor. Time of useful consciousness falls from around 20 minutes at

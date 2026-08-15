@@ -237,6 +237,15 @@ def summarise_result(result: ToolResult) -> str:
             f"{len(crossings)} on the direct course"
         )
 
+    if result.name == "find_procedures":
+        procedures = content.get("procedures", [])
+        if not procedures:
+            return "no applicable procedures"
+        names = ", ".join(item["id"] for item in procedures)
+        conditions = content.get("conditions") or []
+        line = f"{len(procedures)} procedures: {names}"
+        return line + (f"  [{', '.join(conditions)}]" if conditions else "")
+
     if result.name == "get_winds_aloft":
         return (
             f"{content.get('wind_speed_kt')} kt from "

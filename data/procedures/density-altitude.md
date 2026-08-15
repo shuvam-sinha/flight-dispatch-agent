@@ -1,5 +1,6 @@
 # Density altitude
 category: performance
+applies_when: high-elevation
 
 Density altitude is pressure altitude corrected for temperature, and it
 is what the aircraft actually feels. High elevation, high temperature and

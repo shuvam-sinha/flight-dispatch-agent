@@ -60,6 +60,7 @@ from .data_loader import (
     navaids_near_route,
 )
 from .geo import haversine_nm, initial_bearing_deg
+from .grid import count_grid_points, waypoints_for_route
 from .route import NoRouteFound, plan_route
 from .wind import ConstantWindSource
 
@@ -1166,6 +1167,12 @@ def check_airspace(
 
 PHASES = ("preflight", "departure", "cruise", "arrival", "emergency")
 
+# What counts as a water crossing, for selecting oceanic procedures.
+# Both thresholds must be met -- see `_flight_conditions` for the
+# measurements they come from.
+MIN_OCEANIC_GRID_POINTS = 20
+MIN_OCEANIC_GRID_FRACTION = 0.05
+
 
 def _procedure_index():
     """The embedded corpus, built once and kept.
@@ -1179,6 +1186,75 @@ def _procedure_index():
 
         _CACHE["procedures"] = ProcedureIndex.build()
     return _CACHE["procedures"]
+
+
+def _flight_conditions(profile, origin_airport, dest_airport) -> List[str]:
+    """Which preconditions this flight is known to satisfy.
+
+    A document that declares `applies_when` is excluded unless its
+    condition appears here -- see `ProcedureIndex.search` for why
+    similarity alone was not enough.
+
+    KNOWN, NOT ASSUMED. Only conditions derivable from real data are
+    listed. Time of day is absent because nothing in the system records
+    it, so `night` is never satisfied and night procedures stay out
+    unless a caller supplies the condition explicitly. That is the right
+    default: a checklist item that does not apply is noise a pilot has to
+    filter, and the filtering is what a checklist exists to avoid.
+    """
+    conditions: List[str] = []
+
+    if profile.cruise_altitude_ft >= 25000:
+        conditions.append("high-altitude")
+
+    if origin_airport is not None and dest_airport is not None:
+        elevation = max(
+            origin_airport.elevation_ft or 0, dest_airport.elevation_ft or 0
+        )
+        if elevation >= 4000:
+            conditions += ["high-elevation", "mountainous"]
+
+        # OPEN WATER, MEASURED RATHER THAN GUESSED. The routing grid
+        # generates a waypoint wherever no navaid reaches, so a large
+        # number of generated points means a large gap in ground-based
+        # coverage -- which over the planet means water.
+        #
+        # A single generated point does not: navaid coverage has small
+        # holes over land too. The first version of this test asked
+        # merely whether ANY grid point existed and duly declared a
+        # flight across Wisconsin to be oceanic. Measured:
+        #
+        #     KPWK-KMSP     2 grid points   1% of candidates
+        #     KDEN-KMCI     6               3%
+        #     KJFK-KLAX    13               1%
+        #     KJFK-EGLL    62               8%
+        #     LPPT-TNCM    90              45%
+        #
+        # Land routes sit at or below 13 and 3%; genuine crossings start
+        # at 62 and 8%. Both tests must pass, so neither a long domestic
+        # route nor a short hop over a coastal gap qualifies.
+        try:
+            candidates = waypoints_for_route(
+                origin_airport.lat, origin_airport.lon,
+                dest_airport.lat, dest_airport.lon,
+                navaids_near_route(
+                    _navaids(),
+                    origin_airport.lat, origin_airport.lon,
+                    dest_airport.lat, dest_airport.lon,
+                    margin_nm=100.0,
+                ),
+                use_grid=True,
+            )
+            generated = count_grid_points(candidates)
+            if (
+                generated >= MIN_OCEANIC_GRID_POINTS
+                and generated >= MIN_OCEANIC_GRID_FRACTION * len(candidates)
+            ):
+                conditions.append("overwater")
+        except Exception:  # noqa: BLE001 - a hint, never a failure
+            pass
+
+    return conditions
 
 
 def _checklist_query(profile, origin_airport, dest_airport, phase: str) -> str:
@@ -1248,13 +1324,14 @@ def find_procedures(
     dest_airport = airports.get((dest or "").strip().upper())
 
     query = _checklist_query(profile, origin_airport, dest_airport, phase)
+    conditions = _flight_conditions(profile, origin_airport, dest_airport)
 
     try:
         from .retrieval import embed_texts
 
         index = _procedure_index()
         query_vector = embed_texts([query])[0]
-        matches = index.search(query_vector)
+        matches = index.search(query_vector, conditions=conditions)
     except Exception as exc:  # noqa: BLE001 - see dispatch()'s docstring
         return {"error": f"Could not search procedures: {_short_error(exc)}"}
 
@@ -1272,6 +1349,7 @@ def find_procedures(
         "aircraft": profile.name,
         "phase": phase,
         "query": query,
+        "conditions": conditions,
         "procedures": [
             {
                 "id": match.chunk.id,

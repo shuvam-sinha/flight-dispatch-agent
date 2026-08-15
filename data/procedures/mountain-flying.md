@@ -1,5 +1,6 @@
 # Mountain flying
 category: operations
+applies_when: mountainous
 
 Terrain generates its own weather and its own hazards, and both are
 strongest when the wind is strongest.
