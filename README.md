@@ -101,7 +101,7 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
 
 ```bash
-python -m unittest discover tests      # 402 tests
+python -m unittest discover tests      # 410 tests
 ```
 
 ## Layout
@@ -629,4 +629,8 @@ larger-context model drops in.
 - Oceanic routing measured before and after the grid on five routes, including
   two overland controls that must *not* change
 - The agent loop tested against a `ScriptedBackend` — no model, no network
-- **402 unit tests**
+- **The tool layer proved to be an adapter, not new logic**: routes planned via
+  `dispatch("plan_flight")` compared against direct `plan_route()` calls on a
+  domestic hop, a transcontinental route and an ocean crossing — identical
+  waypoints, distance, time, fuel and phase profile
+- **410 unit tests**
