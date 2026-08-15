@@ -101,7 +101,7 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
 
 ```bash
-python -m unittest discover tests      # 396 tests
+python -m unittest discover tests      # 402 tests
 ```
 
 ## Layout
@@ -570,6 +570,22 @@ its service ceiling is 14,000 ft"` as **data**, and the model explained the
 problem and offered alternatives instead of crashing. That is the errors-as-data
 design doing its job.
 
+**The model mistyped numbers it had to reformat.** Two cases, both from real
+transcripts. On a South Atlantic route the oceanic fix `27N023W` was written as
+`27NN023W`. On KSFO-KLAS an ETE of `1h01m` was reported as "1 hour 4 minutes".
+
+The pattern is sharp: in that same KSFO reply, distance, fuel, altitude, wind
+and airspace count were all exact, and the `wind` and `restricted_airspace`
+sentences were copied word for word. The compact token `1h01m` was the only
+thing the model had to *rewrite* rather than repeat -- and rewriting is where
+the error entered.
+
+So the tool supplies the phrasing rather than leaving it to be derived:
+`ete_spoken: "1 hour 1 minute"` alongside the compact `ete`. Same move as the
+compass point, which exists because 239 degrees came back as "from the
+northeast". The remaining error surface here is narrow and worth naming
+precisely: the model is no longer inventing facts, it is making typos.
+
 **A wind fetch failure destroyed the whole plan.** Now the route is replanned in
 still air and returned with a `wind_note` saying so. A degraded answer beats no
 answer.
@@ -613,4 +629,4 @@ larger-context model drops in.
 - Oceanic routing measured before and after the grid on five routes, including
   two overland controls that must *not* change
 - The agent loop tested against a `ScriptedBackend` — no model, no network
-- **396 unit tests**
+- **402 unit tests**

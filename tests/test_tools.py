@@ -782,3 +782,55 @@ class TestWindIsDescribed(unittest.TestCase):
         plan = SimpleNamespace(phases=None)
         profile = SimpleNamespace(cruise_tas_kt=180.0)
         self.assertIn("Live winds aloft applied", _describe_wind(plan, profile))
+
+
+class TestSpokenDuration(unittest.TestCase):
+    """THE BUG THIS COVERS.
+
+    Given `ete: "1h01m"` on a KSFO-KLAS plan, the reply said "1 hour 4
+    minutes". Every other figure in that reply was exact -- distance,
+    fuel, altitude, wind, airspace count -- and the wind and airspace
+    sentences were quoted verbatim. The compact token was the one thing
+    the model had to rewrite, and rewriting is where the error entered.
+
+    So the phrasing is supplied rather than left to be derived, the same
+    move as `_compass_point`.
+    """
+
+    def spoken(self, hours, minutes):
+        from flight_dispatch.tools import _spoken_duration
+
+        return _spoken_duration(hours, minutes)
+
+    def test_the_case_that_was_reported_wrong(self):
+        self.assertEqual(self.spoken(1, 1), "1 hour 1 minute")
+
+    def test_singular_and_plural(self):
+        self.assertEqual(self.spoken(1, 0), "1 hour")
+        self.assertEqual(self.spoken(2, 0), "2 hours")
+        self.assertEqual(self.spoken(0, 1), "1 minute")
+        self.assertEqual(self.spoken(0, 45), "45 minutes")
+
+    def test_hours_and_minutes_together(self):
+        self.assertEqual(self.spoken(18, 2), "18 hours 2 minutes")
+
+    def test_zero_is_still_a_duration(self):
+        self.assertEqual(self.spoken(0, 0), "0 minutes")
+
+    def test_plan_carries_both_forms(self):
+        result = dispatch(
+            "plan_flight",
+            {"origin": "KPWK", "dest": "KMSP", "aircraft": "sr22", "use_wind": False},
+        )
+        self.assertIn("h", result["ete"])
+        self.assertIn("minute", result["ete_spoken"])
+
+    def test_range_warning_uses_the_spoken_form(self):
+        # The warning is prose the model copies, so the duration inside
+        # it should be prose too rather than a token to reformat.
+        result = dispatch(
+            "plan_flight",
+            {"origin": "KJFK", "dest": "KLAX", "aircraft": "c172", "use_wind": False},
+        )
+        self.assertIn("hours", result["range_warning"])
+        self.assertNotIn("h02m", result["range_warning"])

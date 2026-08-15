@@ -812,6 +812,20 @@ def plan_flight(
     whole_hours = int(hours_en_route)
     minutes = int(round((hours_en_route - whole_hours) * 60))
     result["ete"] = f"{whole_hours}h{minutes:02d}m"
+
+    # THE SPOKEN FORM EXISTS BECAUSE THE MODEL GETS THE CONVERSION WRONG.
+    #
+    # Given `ete: "1h01m"` on a KSFO-KLAS plan, the reply said "1 hour 4
+    # minutes". Every other figure in that reply was exact -- distance,
+    # fuel, altitude, wind, airspace count. The compact token is the one
+    # thing it had to REWRITE rather than repeat, and rewriting is where
+    # the error entered. The same reply quoted the wind and airspace
+    # sentences verbatim.
+    #
+    # So hand over the phrasing it was going to produce anyway. This is
+    # the same move as `_compass_point`, which exists because 239 degrees
+    # came back as "from the northeast".
+    result["ete_spoken"] = _spoken_duration(whole_hours, minutes)
     result["ete_hours"] = round(hours_en_route, 2)
     result["average_ground_speed_kt"] = round(ground_speed)
     result["fuel_required_gal"] = round(
@@ -841,8 +855,9 @@ def plan_flight(
                 f"tops out around {phases.cruise_altitude_ft:,.0f} ft."
             )
         result["ete_note"] = (
-            "ETE is airborne time from takeoff to landing. It excludes taxi, "
-            "so it reads lower than a published schedule."
+            "Report the time as written in `ete_spoken`; do not reformat "
+            "`ete`. ETE is airborne time from takeoff to landing and "
+            "excludes taxi, so it reads lower than a published schedule."
         )
 
     endurance = profile.endurance_hours(payload)
@@ -862,7 +877,8 @@ def plan_flight(
         if plan.grid_waypoints_used:
             result["range_warning"] = (
                 f"The {profile.name} cannot fly this route. Flight time is "
-                f"{whole_hours}h{minutes:02d}m against {endurance:.1f} h of "
+                f"{_spoken_duration(whole_hours, minutes)} against "
+                f"{endurance:.1f} h of "
                 f"endurance, and the route crosses open water where there is "
                 "nowhere to refuel. Say plainly that this is the wrong "
                 "aircraft for the trip, and suggest planning again with a "
@@ -870,7 +886,8 @@ def plan_flight(
             )
         else:
             result["range_warning"] = (
-                f"Flight time of {whole_hours}h{minutes:02d}m exceeds the "
+                f"Flight time of {_spoken_duration(whole_hours, minutes)} "
+                f"exceeds the "
                 f"{profile.name}'s {endurance:.1f} h endurance. About "
                 f"{stops} fuel stop{'s' if stops != 1 else ''} would be needed "
                 "-- tell the user this plainly."
@@ -883,6 +900,21 @@ def plan_flight(
         )
 
     return result
+
+
+def _spoken_duration(hours: int, minutes: int) -> str:
+    """A duration written the way a person would say it.
+
+    Singular and plural both matter: "1 hour 1 minute", not "1 hours 1
+    minutes". A model asked to fix that up is a model doing a conversion,
+    which is the thing being avoided.
+    """
+    parts = []
+    if hours:
+        parts.append(f"{hours} hour" + ("s" if hours != 1 else ""))
+    if minutes or not hours:
+        parts.append(f"{minutes} minute" + ("s" if minutes != 1 else ""))
+    return " ".join(parts)
 
 
 def _describe_wind(plan, profile) -> str:
