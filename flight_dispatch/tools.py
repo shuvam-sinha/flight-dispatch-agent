@@ -1160,6 +1160,137 @@ def check_airspace(
 # Registry
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# CP5: retrieval
+# ---------------------------------------------------------------------------
+
+PHASES = ("preflight", "departure", "cruise", "arrival", "emergency")
+
+
+def _procedure_index():
+    """The embedded corpus, built once and kept.
+
+    Loaded lazily like the airport data: embedding fifteen documents
+    costs a second, and a conversation that never asks for a checklist
+    should not pay it.
+    """
+    if "procedures" not in _CACHE:
+        from .retrieval import ProcedureIndex
+
+        _CACHE["procedures"] = ProcedureIndex.build()
+    return _CACHE["procedures"]
+
+
+def _checklist_query(profile, origin_airport, dest_airport, phase: str) -> str:
+    """Turn a flight into the text that gets embedded.
+
+    THE QUERY IS BUILT FROM FACTS, NOT FROM THE USER'S WORDS. The model
+    could be asked to describe the flight and that description embedded,
+    but then retrieval would depend on how well it phrased things, and a
+    forgotten detail would silently drop a relevant procedure. Everything
+    below comes from the aircraft profile and the airport records.
+
+    Each clause selects a different part of the corpus: a turbine at
+    39,000 ft wants the high-altitude and oceanic material, a piston
+    single wants engine failure and density altitude.
+    """
+    terms = [phase, profile.name, profile.category]
+
+    if profile.category == "ga":
+        terms += ["light aircraft", "single engine piston", "visual flight"]
+    else:
+        terms += ["turbine", "pressurised", "airline operations"]
+
+    if profile.cruise_altitude_ft >= 25000:
+        terms += ["high altitude", "oxygen", "pressurisation", "jet stream"]
+
+    if origin_airport is not None and dest_airport is not None:
+        elevation = max(
+            origin_airport.elevation_ft or 0, dest_airport.elevation_ft or 0
+        )
+        if elevation >= 4000:
+            terms += ["high elevation airfield", "density altitude", "mountain"]
+
+        if haversine_nm(
+            origin_airport.lat, origin_airport.lon,
+            dest_airport.lat, dest_airport.lon,
+        ) > 1000:
+            terms += ["long range", "diversion", "alternate planning", "oceanic"]
+
+    return " ".join(terms)
+
+
+def find_procedures(
+    aircraft: str,
+    phase: str = "preflight",
+    origin: Optional[str] = None,
+    dest: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retrieve procedure documents relevant to a flight.
+
+    RETURNS SOURCE MATERIAL, NOT A CHECKLIST. The model writes the
+    checklist; this decides what it is allowed to write from. That split
+    is the point: a model asked for a Cessna 172 checklist unaided
+    produces confident, plausible, invented procedures, which is the
+    failure this whole project is built against.
+    """
+    try:
+        profile = get_aircraft(aircraft)
+    except KeyError:
+        return {"error": f"Unknown aircraft {aircraft!r}.",
+                "hint": "Use list_aircraft to see valid keys."}
+
+    if phase not in PHASES:
+        return {"error": f"Unknown phase {phase!r}.", "valid_phases": list(PHASES)}
+
+    airports = _airports()
+    origin_airport = airports.get((origin or "").strip().upper())
+    dest_airport = airports.get((dest or "").strip().upper())
+
+    query = _checklist_query(profile, origin_airport, dest_airport, phase)
+
+    try:
+        from .retrieval import embed_texts
+
+        index = _procedure_index()
+        query_vector = embed_texts([query])[0]
+        matches = index.search(query_vector)
+    except Exception as exc:  # noqa: BLE001 - see dispatch()'s docstring
+        return {"error": f"Could not search procedures: {_short_error(exc)}"}
+
+    if not matches:
+        return {
+            "query": query,
+            "procedures": [],
+            "note": (
+                "No procedure in the corpus is relevant to this flight. Say so "
+                "rather than writing a checklist from general knowledge."
+            ),
+        }
+
+    return {
+        "aircraft": profile.name,
+        "phase": phase,
+        "query": query,
+        "procedures": [
+            {
+                "id": match.chunk.id,
+                "title": match.chunk.title,
+                "category": match.chunk.category,
+                "text": match.chunk.text,
+                "relevance": round(match.score, 3),
+            }
+            for match in matches
+        ],
+        "note": (
+            "Write the checklist using ONLY these procedures. Cite the `id` of "
+            "the procedure each item came from, like [fuel-reserves]. If "
+            "something a pilot would want is not covered here, say it is not "
+            "covered rather than supplying it from memory."
+        ),
+    }
+
+
 TOOLS: List[ToolSpec] = [
     ToolSpec(
         name="find_airport",
@@ -1356,6 +1487,47 @@ TOOLS: List[ToolSpec] = [
             },
         },
         func=check_airspace,
+    ),
+    ToolSpec(
+        name="find_procedures",
+        description=(
+            "Retrieve real aviation procedure documents relevant to a flight. "
+            "Call this whenever the user asks for a checklist, briefing, or "
+            "what to consider or watch out for on a flight. It returns source "
+            "material, not a finished checklist -- write the checklist from "
+            "what it returns and cite the id of each procedure you use. Never "
+            "add items from your own knowledge: an invented procedure in a "
+            "checklist is exactly what this tool exists to prevent."
+        ),
+        parameters={
+            "aircraft": {
+                "type": "string",
+                "description": (
+                    "Which aircraft the checklist is for. Common keys: "
+                    "c172 (Cessna 172), sr22 (Cirrus SR22), b350 (King Air), "
+                    "b738 (Boeing 737-800), b789 (Boeing 787-9)."
+                ),
+                "enum": sorted(AIRCRAFT),
+                "required": True,
+            },
+            "phase": {
+                "type": "string",
+                "description": "Phase of flight the checklist covers.",
+                "enum": list(PHASES),
+                "required": False,
+            },
+            "origin": {
+                "type": "string",
+                "description": "Origin ICAO code, if known. Sharpens the retrieval.",
+                "required": False,
+            },
+            "dest": {
+                "type": "string",
+                "description": "Destination ICAO code, if known.",
+                "required": False,
+            },
+        },
+        func=find_procedures,
     ),
 ]
 
