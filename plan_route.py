@@ -104,6 +104,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Cruise altitude in feet (default: the aircraft's own)",
     )
     parser.add_argument(
+        "--no-grid",
+        action="store_true",
+        help="Disable virtual oceanic waypoints (navaids only)",
+    )
+    parser.add_argument(
         "--avoid-airspace",
         action="store_true",
         help="Route around FAA prohibited/restricted/warning areas",
@@ -203,9 +208,19 @@ def format_plan(plan: RoutePlan) -> str:
         minutes = int(round((plan.ete_hours - hours) * 60))
         ground_speed = plan.average_ground_speed_kt or 0.0
 
-        # Average ground speed against cruise TAS says at a glance whether
-        # the flight was helped or hindered overall.
-        delta = ground_speed - plan.aircraft.cruise_tas_kt
+        # Ground speed against cruise TAS says at a glance whether the
+        # flight was helped or hindered overall -- but the comparison has
+        # to be made in the CRUISE, not across the whole flight. Climb
+        # and descent are flown below cruise speed by design, so once
+        # they are in the average, every flight looks like it fought a
+        # headwind. The cruise segment is the part the wind acted on.
+        cruise_speed = ground_speed
+        if plan.phases is not None and plan.phases.cruise_time_hours > 0:
+            cruise_speed = (
+                plan.phases.cruise_distance_nm / plan.phases.cruise_time_hours
+            )
+
+        delta = cruise_speed - plan.aircraft.cruise_tas_kt
         wind_note = (
             f"net tailwind {delta:+.0f} kt"
             if delta >= 0
@@ -213,17 +228,36 @@ def format_plan(plan: RoutePlan) -> str:
         )
 
         lines += [
-            f"ETE:             {hours}h{minutes:02d}m "
-            f"(avg {ground_speed:.0f} kt GS, {wind_note})",
+            f"ETE:             {hours}h{minutes:02d}m airborne "
+            f"(avg {ground_speed:.0f} kt GS, cruise {wind_note})",
             f"Fuel required:   {plan.fuel_required_gal:.1f} gal "
             f"(incl. {plan.aircraft.reserve_minutes:.0f} min reserve)",
         ]
+
+        if plan.phases is not None:
+            p = plan.phases
+            lines.append(
+                f"Profile:         climb {p.climb_time_hours * 60:.0f} min / "
+                f"{p.climb_distance_nm:.0f} nm, cruise {p.cruise_distance_nm:.0f} nm "
+                f"at {p.cruise_altitude_ft:,.0f} ft, descent "
+                f"{p.descent_time_hours * 60:.0f} min / {p.descent_distance_nm:.0f} nm"
+            )
+            if not p.reached_planned_altitude:
+                lines.append(
+                    f"                 too short to reach planned cruise level"
+                )
 
         if plan.is_within_range() is False:
             lines.append(
                 f"WARNING:         exceeds endurance of "
                 f"{plan.aircraft.endurance_hours():.1f} h -- a fuel stop is required"
             )
+
+    if plan.grid_waypoints_used:
+        lines.append(
+            f"Oceanic fixes:   {plan.grid_waypoints_used} of "
+            f"{len(plan.waypoints)} waypoints are generated lat/lon points"
+        )
 
     if plan.airspace_avoided is not None:
         lines.append(
@@ -313,7 +347,9 @@ def build_wind_source(spec: Optional[str]):
         # live data is asked for.
         from flight_dispatch.wind_openmeteo import OpenMeteoWindSource
 
-        return OpenMeteoWindSource()
+        # Routing never reads the temperature, and requesting it is a
+        # third of the cost of every call -- see wind_openmeteo.
+        return OpenMeteoWindSource(want_temperature=False)
 
     try:
         direction, speed = spec.split("/")
@@ -418,6 +454,7 @@ def main(argv=None) -> int:
                 wind_source=wind_source,
                 altitude_ft=args.altitude,
                 airspace=airspace_index,
+                use_grid=not args.no_grid,
             )
         except NoRouteFound as exc:
             raise SystemExit(str(exc))

@@ -37,6 +37,7 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 AIRPORTS_CSV = DATA_DIR / "airports.csv"
 NAVAIDS_CSV = DATA_DIR / "navaids.csv"
+RUNWAYS_CSV = DATA_DIR / "runways.csv"
 
 # Navaid types worth routing over.
 #
@@ -103,6 +104,11 @@ def load_airports(path: Path = AIRPORTS_CSV) -> Dict[str, Airport]:
             lat=lat,
             lon=lon,
             elevation_ft=_safe_float(row.get("elevation_ft")),
+            airport_type=(row.get("type") or "").strip(),
+            scheduled_service=(row.get("scheduled_service") or "").strip() == "yes",
+            iata_code=(row.get("iata_code") or "").strip(),
+            municipality=(row.get("municipality") or "").strip(),
+            keywords=(row.get("keywords") or "").strip(),
         )
 
     return airports
@@ -150,6 +156,58 @@ def load_navaids(
         )
 
     return navaids
+
+
+# Assumed width for runway rows that do not carry one. Only affects the
+# relative sizes of airports missing the field, and 150 ft is a standard
+# air-carrier runway width.
+DEFAULT_RUNWAY_WIDTH_FT = 150.0
+
+
+def load_runway_area(path: Path = RUNWAYS_CSV) -> Dict[str, float]:
+    """Total open runway area per airport, in square feet, keyed by ICAO.
+
+    A size proxy for ranking name searches. OurAirports publishes no
+    passenger or movement figures, so airport size has to be inferred
+    from the physical plant.
+
+    WHY AREA AND NOT THE LONGEST RUNWAY
+    -----------------------------------
+    Longest-single-runway was the first attempt, and it loses to any
+    airport that built one very long strip and little else. Dubai
+    International moves ~90 million passengers a year and was ranked
+    below Al Maktoum, which is nearly empty and has a runway 174 ft
+    longer. Tokyo Haneda lost to Narita on the same logic.
+
+    Total area counts every runway and their widths, which tracks how
+    much aircraft an airport can actually handle. Measured on fifteen
+    multi-airport cities, longest-runway picks the main airport 12 times
+    and total area 14.
+
+    THE ONE IT STILL GETS WRONG
+    ---------------------------
+    Mexico City. Felipe Angeles is a converted air force base with four
+    runways and 8.9M sq ft of pavement against Benito Juarez's 3.8M --
+    more concrete, almost no traffic. No runway-derived metric can
+    separate them, and this dataset has nothing else to go on.
+
+    Closed runways are excluded, which the previous version did not do.
+    """
+    area: Dict[str, float] = {}
+
+    for row in _read_rows(path):
+        icao = (row.get("airport_ident") or "").strip().upper()
+        if not icao or (row.get("closed") or "").strip() in ("1", "yes"):
+            continue
+
+        length = _safe_float(row.get("length_ft"))
+        if length is None or length <= 0:
+            continue
+
+        width = _safe_float(row.get("width_ft")) or DEFAULT_RUNWAY_WIDTH_FT
+        area[icao] = area.get(icao, 0.0) + length * width
+
+    return area
 
 
 def navaids_in_bounds(

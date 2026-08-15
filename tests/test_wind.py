@@ -164,3 +164,106 @@ class TestWindSources(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRateLimitBackoff(unittest.TestCase):
+    """THE BUG THESE COVER.
+
+    Open-Meteo meters work, not requests: a call costs roughly
+    locations x variables x forecast days. Batching 50 coordinates made
+    each request fifty times as expensive, and a KJFK-KLAX mesh needs 20
+    of them -- about 1,000 units against a 600-per-minute allowance. The
+    server answered "Minutely API request limit exceeded", the backoff
+    waited 2s then 4s then gave up, and every long route silently planned
+    in still air.
+    """
+
+    class FakeResponse:
+        def __init__(self, headers=None, payload=None, text=""):
+            self.headers = headers or {}
+            self._payload = payload
+            self.text = text
+
+        def json(self):
+            if self._payload is None:
+                raise ValueError("no json")
+            return self._payload
+
+    def source(self):
+        from flight_dispatch.wind_openmeteo import OpenMeteoWindSource
+
+        return OpenMeteoWindSource()
+
+    def test_a_minutely_limit_waits_out_the_minute(self):
+        from flight_dispatch.wind_openmeteo import MINUTELY_RESET_S
+
+        response = self.FakeResponse(
+            payload={"reason": "Minutely API request limit exceeded."}
+        )
+        self.assertEqual(self.source()._retry_wait(response, 0), MINUTELY_RESET_S)
+
+    def test_the_old_backoff_could_not_have_worked(self):
+        # Two seconds against a sixty-second window.
+        response = self.FakeResponse(
+            payload={"reason": "Minutely API request limit exceeded."}
+        )
+        self.assertGreater(self.source()._retry_wait(response, 0), 30.0)
+
+    def test_retry_after_header_wins_when_present(self):
+        response = self.FakeResponse(headers={"Retry-After": "5"})
+        self.assertEqual(self.source()._retry_wait(response, 0), 5.0)
+
+    def test_unparseable_retry_after_falls_through(self):
+        response = self.FakeResponse(headers={"Retry-After": "soon"})
+        self.assertGreater(self.source()._retry_wait(response, 0), 0)
+
+    def test_other_limits_back_off_exponentially(self):
+        response = self.FakeResponse(payload={"reason": "Hourly limit exceeded."})
+        wait_first = self.source()._retry_wait(response, 0)
+        wait_later = self.source()._retry_wait(response, 2)
+        self.assertLess(wait_first, wait_later)
+
+    def test_never_sleeps_longer_than_the_cap(self):
+        from flight_dispatch.wind_openmeteo import MAX_RETRY_WAIT_S
+
+        response = self.FakeResponse(headers={"Retry-After": "99999"})
+        self.assertLessEqual(self.source()._retry_wait(response, 0), MAX_RETRY_WAIT_S)
+
+    def test_a_body_that_is_not_json_does_not_crash(self):
+        response = self.FakeResponse(text="rate limited")
+        self.assertGreater(self.source()._retry_wait(response, 0), 0)
+
+
+class TestRequestCost(unittest.TestCase):
+    """Every variable and every forecast day multiplies the quota cost."""
+
+    def captured_params(self, **kwargs):
+        from unittest.mock import patch
+
+        from flight_dispatch.wind_openmeteo import OpenMeteoWindSource
+
+        source = OpenMeteoWindSource(**kwargs)
+        with patch.object(source, "_get_with_retry", return_value=None) as get:
+            source._fetch_batch([(40.0, -90.0)], 250)
+            return get.call_args[0][0]
+
+    def test_only_one_forecast_day_is_requested(self):
+        # The second day was fetched and thrown away -- only one hour is
+        # ever read, and it is today's.
+        self.assertEqual(self.captured_params()["forecast_days"], 1)
+
+    def test_routing_does_not_request_temperature(self):
+        params = self.captured_params(want_temperature=False)
+        self.assertNotIn("temperature", params["hourly"])
+        self.assertIn("wind_speed", params["hourly"])
+        self.assertIn("wind_direction", params["hourly"])
+
+    def test_single_point_lookups_still_get_temperature(self):
+        # get_winds_aloft reports it, so it is part of that answer.
+        self.assertIn("temperature", self.captured_params()["hourly"])
+
+    def test_routing_asks_for_two_variables_not_three(self):
+        routing = self.captured_params(want_temperature=False)["hourly"].split(",")
+        display = self.captured_params()["hourly"].split(",")
+        self.assertEqual(len(routing), 2)
+        self.assertEqual(len(display), 3)
