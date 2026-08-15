@@ -83,16 +83,19 @@ class TestParameterExposure(unittest.TestCase):
             self.assertTrue(_is_exposed(spec), name)
             self.assertIn("enum", spec, name)
 
-    def test_plan_flight_altitude_stays_withheld(self):
+    def test_plan_flight_offers_no_altitude_to_any_backend(self):
         # And exposing it everywhere was also wrong. Given "KJFK to KLAX
         # in a 737" the model volunteered altitude_ft=30000 unasked, then
         # carried it into "what about in a 172?" -- an aircraft with a
-        # 14,000 ft ceiling -- and the plan was refused. The aircraft
-        # profile already knows a better answer than the model will
-        # invent.
-        spec = TOOLS_BY_NAME["plan_flight"].parameters["altitude_ft"]
-        self.assertFalse(_is_exposed(spec))
-        self.assertNotIn("enum", spec)
+        # 14,000 ft ceiling -- and the plan was refused.
+        #
+        # That was first fixed by removing an enum so _is_exposed would
+        # withhold it, which put a decision about the TOOL inside ONE
+        # BACKEND. Ollama's JSON Schema can express optionality, so it
+        # rebuilt the parameter and volunteered 30,000 ft for a Cirrus.
+        # The parameter is now simply not declared, so no backend can
+        # offer it.
+        self.assertNotIn("altitude_ft", TOOLS_BY_NAME["plan_flight"].parameters)
 
     def test_plan_flight_still_exposes_what_the_model_needs(self):
         params = TOOLS_BY_NAME["plan_flight"].parameters

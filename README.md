@@ -15,7 +15,7 @@ synthesises the results — every number it reports comes from real tool output.
 **Checkpoints 1–4 complete.** A\* routing over a waypoint mesh built from real
 navaid data, with flight time as the cost function, live global winds aloft, FAA
 restricted-airspace avoidance, a virtual routing grid for oceanic legs, and a
-conversational dispatcher agent running on-device.
+conversational dispatcher agent that runs against two local model backends.
 
 ## Setup
 
@@ -52,7 +52,8 @@ every number in the prose above came out of a Python function, not the model.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--backend` | `apple` | Model backend |
+| `--backend` | asks | `apple` (on-device) or `ollama` (local, 32K context) |
+| `--model` | `llama3.1` | Ollama model name |
 | `--all-tools` | off | Expose all 5 tools instead of the lean 3 |
 | `--ask "..."` | — | One-shot question, then exit |
 | `--quiet` | off | Hide tool calls |
@@ -101,7 +102,7 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
 
 ```bash
-python -m unittest discover tests      # 410 tests
+python -m unittest discover tests      # 470 tests
 ```
 
 ## Layout
@@ -128,6 +129,7 @@ route.py        plan_route() — ties the above into a RoutePlan
 tools.py        the five tools, as ToolSpecs with English descriptions
 agent.py        the loop; ModelBackend protocol
 backend_apple.py    on-device Foundation Models
+backend_ollama.py   a larger local model — and the one the loop drives
   ↓
 plan_route.py   CLI          dispatch.py   conversational REPL
 ```
@@ -180,8 +182,8 @@ graph, which is the best ground speed physically achievable and therefore a
 valid lower bound.
 
 **Winds:** live global forecasts from Open-Meteo. Coordinates are batched,
-snapped to a 0.5° grid and cached, so a 78,707-edge mesh collapses to 955 grid
-cells and 10 HTTP requests. `WindSource` is a narrow protocol, so alternative
+snapped to a grid and cached, so a 78,707-edge mesh collapses to a few hundred
+cells and a handful of concurrent HTTP requests. `WindSource` is a narrow protocol, so alternative
 backends drop in without the router knowing.
 
 **Airspace:** 780 blocking FAA volumes, indexed with an STRtree. An edge
@@ -294,9 +296,56 @@ paper over sloppy tool design. Two constraints followed from it:
   own reasoning, so `dispatch.py` exposes a lean three by default and
   `--all-tools` opts into the rest.
 
-`ModelBackend` exists precisely so this choice is reversible — a Claude API
-backend is a third implementation of the same three methods, and the loop above
-it does not change.
+`ModelBackend` exists precisely so this choice is reversible — and it now has
+two implementations, selected with `--backend`.
+
+### Why a second backend, and what it proved
+
+Apple's SDK runs the tool loop itself, so `agent.py`'s hand-written loop makes
+one pass and exits. The orchestration was written, tested and documented — and
+never actually orchestrated. Ollama returns `tool_calls` for the caller to
+execute, exactly as the Claude API does, so the loop finally drives a real
+conversation. `send_tool_results` is asserted *unreachable* in the Apple tests
+and is exercised on every round here.
+
+`ToolSpec.json_schema()` needed no adaptation: Ollama takes OpenAI-style
+function schemas, which is what was already being rendered for Claude. The
+backend converts message shapes and nothing else.
+
+Running identical tools against a 3B and an 8B model settled several open
+questions in one evening:
+
+| | Apple (3B) | Ollama (8B) |
+| --- | --- | --- |
+| Tool schemas | 1,355 tokens = **33%** of the window | 1,366 = **4%** |
+| Asked for wind at 34,000 ft | planned a flight instead, twice | called `get_winds_aloft` correctly |
+| 30-waypoint oceanic route | `27N023W` → `27NN023W` | copied intact |
+| Conversation depth | dead at turn 3 | 14% used after 7 |
+
+So the tool-selection failures were **model capacity**, not description quality.
+One number still slipped in transcription (`18871.7` → `18771.7`), which says
+the "supply the phrasing, never make the model derive it" work was correct
+engineering rather than a workaround for a small model.
+
+The new backend also exposed three bugs the first one had hidden:
+
+- **Stringified arguments.** Ollama sends `payload_lb='300'`, which reached the
+  weight arithmetic as text and raised a `TypeError`. Worse, `avoid_airspace='true'`
+  never raised — a non-empty string is truthy, so `'false'` would have been too,
+  quietly turning airspace avoidance *on* when the model asked for it off.
+  Coercion now happens once in `dispatch()`, against each parameter's declared
+  type, so every tool and every future backend inherits it.
+- **A fix in the wrong layer.** Withholding `altitude_ft` was implemented inside
+  `backend_apple._is_exposed`, which is Apple's rule — needed because its schema
+  cannot express optionality. JSON Schema can, so Ollama rebuilt the parameter
+  and volunteered 30,000 ft for a Cirrus that tops out at 17,500. A decision
+  about the *tool* now lives in the tool.
+- **Tool calls written as text.** llama3.1 sometimes writes
+  `{"name": "plan_flight", "parameters": {...}}` into its reply instead of
+  emitting a call — both observed cases followed a tool result. The loop saw
+  prose, concluded the model was finished, and handed raw JSON to the user.
+  Recognised and executed now, guarded so that only a name matching an exposed
+  tool is run.
 
 ### Why the tool descriptions are prose, not code
 
@@ -515,6 +564,31 @@ nowhere to land, and the oceanic waypoints already record exactly that. Overland
 shortfalls suggest fuel stops; oceanic ones say the aircraft cannot fly the
 route.
 
+**A single flight plan could exhaust the API quota.** Live winds failed on every
+long route for three sessions running — precisely the flights where wind matters
+most. Open-Meteo meters *work*, not requests: roughly locations × variables ×
+days, against ~600 units per minute on the free tier. At a fixed 0.5° grid the
+cost scaled with route length:
+
+```
+route          0.5 deg      1.0 deg      2.0 deg
+KPWK-KMSP     168 cells     64 cells     26 cells
+KBOS-KDEN     562          244           92
+KJFK-KLAX     968          422          148
+```
+
+A transcontinental plan wanted ~1,936 units and exhausted the minute by itself,
+so no retry schedule could have helped. The cell count is now capped and the
+resolution follows, chosen once where the whole route is visible: short routes
+keep the fine grid, long ones coarsen. Measured on real meshes, all four test
+routes moved inside the budget where three had been outside it.
+
+Batches are also fetched concurrently — they are independent and the wait is
+entirely network — and retries distinguish limits that waiting clears from ones
+it cannot. An hourly or daily cap is no longer retried, and the error carries
+the server's own words, so "try again tomorrow" reaches the user instead of
+`HTTPError`.
+
 **Live winds were read at the wrong hour.** `forecast_hour=0` was documented as
 "roughly now." Open-Meteo's hourly series starts at 00:00 UTC of the current
 day, so index 0 is midnight — accurate at 00:30 UTC and twenty-three hours stale
@@ -628,9 +702,10 @@ larger-context model drops in.
 - Airspace avoidance verified leg-by-leg: 9 crossings before, 0 after
 - Oceanic routing measured before and after the grid on five routes, including
   two overland controls that must *not* change
-- The agent loop tested against a `ScriptedBackend` — no model, no network
+- The agent loop tested against a `ScriptedBackend` — no model, no network, and
+  end to end against the Ollama backend, which is the one that drives it
 - **The tool layer proved to be an adapter, not new logic**: routes planned via
   `dispatch("plan_flight")` compared against direct `plan_route()` calls on a
   domestic hop, a transcontinental route and an ocean crossing — identical
   waypoints, distance, time, fuel and phase profile
-- **410 unit tests**
+- **470 unit tests**

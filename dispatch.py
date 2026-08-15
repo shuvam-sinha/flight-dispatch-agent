@@ -61,9 +61,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        default="apple",
-        choices=["apple"],
-        help="Model backend (default: apple, on-device)",
+        choices=["apple", "ollama"],
+        help="Model backend. Omit to be asked, or to default to apple "
+             "when not running interactively.",
+    )
+    parser.add_argument(
+        "--model",
+        help="Ollama model name (default: llama3.1). Ignored for --backend apple.",
     )
     parser.add_argument(
         "--all-tools",
@@ -83,7 +87,51 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def build_backend(name: str):
+BACKEND_CHOICES = (
+    ("apple", "Apple Foundation Models", "on-device, 4,096 tokens, no setup"),
+    ("ollama", "Ollama", "local, 32,768 tokens, needs `ollama serve`"),
+)
+
+
+def choose_backend_interactively() -> str:
+    """Ask which model to use, when nothing said.
+
+    Only reached from a terminal with no --backend flag. Anything
+    scripted -- a pipe, --ask, a test -- takes the default instead, since
+    a menu that blocks a piped command is a bug rather than a feature.
+    """
+    print(bold("Which model?"))
+    for index, (_, title, detail) in enumerate(BACKEND_CHOICES, start=1):
+        print(f"  {bold(str(index))}  {title:<26} {dim(detail)}")
+    print()
+
+    try:
+        answer = input(bold(f"choose [1]: ")).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return BACKEND_CHOICES[0][0]
+
+    print()
+    if not answer:
+        return BACKEND_CHOICES[0][0]
+    for index, (key, _, _) in enumerate(BACKEND_CHOICES, start=1):
+        if answer in (str(index), key):
+            return key
+
+    print(dim(f"  not a choice, using {BACKEND_CHOICES[0][0]}\n"))
+    return BACKEND_CHOICES[0][0]
+
+
+def resolve_backend_name(args) -> str:
+    """Which backend to build: the flag, an answer, or the default."""
+    if args.backend:
+        return args.backend
+    if args.ask or not sys.stdin.isatty():
+        return BACKEND_CHOICES[0][0]
+    return choose_backend_interactively()
+
+
+def build_backend(name: str, model: Optional[str] = None):
     """Construct a backend, or exit with an actionable message."""
     if name == "apple":
         from flight_dispatch.backend_apple import (
@@ -95,6 +143,18 @@ def build_backend(name: str):
             return AppleBackend()
         except AppleBackendUnavailable as exc:
             raise SystemExit(f"{red('On-device model unavailable')}\n\n{exc}")
+
+    if name == "ollama":
+        from flight_dispatch.backend_ollama import (
+            DEFAULT_MODEL,
+            OllamaBackend,
+            OllamaUnavailable,
+        )
+
+        try:
+            return OllamaBackend(model=model or DEFAULT_MODEL)
+        except OllamaUnavailable as exc:
+            raise SystemExit(f"{red('Ollama unavailable')}\n\n{exc}")
 
     raise SystemExit(f"Unknown backend: {name}")
 
@@ -314,7 +374,7 @@ def run_session(agent: DispatcherAgent, backend, tools, show_tools: bool) -> int
 def main(argv=None) -> int:
     args = parse_args(argv)
 
-    backend = build_backend(args.backend)
+    backend = build_backend(resolve_backend_name(args), args.model)
     tools = choose_tools(args.all_tools)
     agent = DispatcherAgent(backend, tools=tools)
 

@@ -902,6 +902,60 @@ def plan_flight(
     return result
 
 
+_TRUE_WORDS = {"true", "yes", "1", "on"}
+_FALSE_WORDS = {"false", "no", "0", "off"}
+
+
+def _coerce_arguments(tool: "ToolSpec", arguments: Dict[str, Any]):
+    """Convert stringified arguments to the types the schema declares.
+
+    THE CRASH THIS PREVENTS. Ollama sends numbers and booleans as
+    strings: `payload_lb='300'`, `avoid_airspace='true'`. The payload
+    reached the weight arithmetic as text and raised
+    `TypeError: unsupported operand type(s) for -: 'float' and 'str'`.
+    `avoid_airspace='true'` did not raise -- a non-empty string is truthy
+    -- which is worse, because `'false'` would have been truthy too and
+    quietly turned airspace avoidance ON when the model asked for it off.
+
+    Doing this in `dispatch()` rather than in each tool means it holds
+    for every tool and every backend, including ones not written yet. A
+    backend that stringifies is not misbehaving; JSON has no way to say
+    "this string is a number", and models are inconsistent about it.
+
+    Returns the converted arguments and an error string, which is empty
+    when everything converted. An unconvertible value comes back as a
+    message the model can act on rather than an exception -- the same
+    reasoning as everywhere else in this module.
+    """
+    converted = dict(arguments)
+
+    for key, value in arguments.items():
+        declared = tool.parameters.get(key, {}).get("type")
+
+        if declared == "number" and isinstance(value, str):
+            try:
+                converted[key] = float(value)
+            except ValueError:
+                return converted, f"{key}={value!r} is not a number."
+
+        elif declared == "integer" and isinstance(value, str):
+            try:
+                converted[key] = int(float(value))
+            except ValueError:
+                return converted, f"{key}={value!r} is not a whole number."
+
+        elif declared == "boolean" and isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in _TRUE_WORDS:
+                converted[key] = True
+            elif lowered in _FALSE_WORDS:
+                converted[key] = False
+            else:
+                return converted, f"{key}={value!r} is not true or false."
+
+    return converted, ""
+
+
 def _spoken_duration(hours: int, minutes: int) -> str:
     """A duration written the way a person would say it.
 
@@ -1211,31 +1265,32 @@ TOOLS: List[ToolSpec] = [
                 "description": "Route around prohibited and restricted airspace. Default true.",
                 "required": False,
             },
-            # NO ENUM HERE, DELIBERATELY -- so this stays withheld from
-            # a backend that cannot express optionality.
+            # `altitude_ft` IS DELIBERATELY ABSENT.
             #
-            # It briefly had one, and the enum broke a working
-            # conversation within the hour. Given "plan a flight from
-            # KJFK to KLAX in a 737" the model volunteered
-            # altitude_ft='30000' -- nobody asked, and a 737-800 cruises
-            # at 35,000. Then "what about in a 172?" carried the 30,000
-            # forward into an aircraft with a 14,000 ft service ceiling,
-            # and the plan was refused outright. Before the enum existed
-            # the model could not set it and both flights planned fine.
+            # `plan_flight()` still takes it, and the CLI still passes it
+            # via --altitude. It is simply not offered to any model,
+            # because models volunteer a cruise altitude nobody asked for
+            # and pick a bad one:
             #
-            # The distinction that matters: expose an altitude where the
-            # altitude IS the question, as in get_winds_aloft, where wind
-            # without one is meaningless. Withhold it where the aircraft
-            # already knows its own answer. A profile's cruise altitude
-            # is a better number than any the model will invent.
-            "altitude_ft": {
-                "type": "number",
-                "description": (
-                    "Cruise altitude in feet. Defaults to the aircraft's own "
-                    "normal cruise altitude."
-                ),
-                "required": False,
-            },
+            #   "plan KJFK to KLAX in a 737"  -> altitude_ft=30000
+            #       (a 737-800 cruises at 35,000)
+            #   "what about in a 172?"        -> carried 30000 forward
+            #       (service ceiling 14,000 -- the plan was refused)
+            #   "plan KPWK to KMSP in a Cirrus" -> altitude_ft=30000
+            #       (an SR22 tops out at 17,500)
+            #
+            # This was first fixed by removing an enum, which made
+            # `backend_apple._is_exposed` withhold it. That was the right
+            # decision in the wrong place: `_is_exposed` is Apple's rule,
+            # needed because Apple's schema cannot express optionality.
+            # JSON Schema can, so Ollama built the parameter back in from
+            # this dict and volunteered 30,000 ft for a Cirrus on its
+            # first evening. A decision about the TOOL belongs in the
+            # tool, where every backend inherits it.
+            #
+            # `get_winds_aloft` keeps its altitude, because there the
+            # altitude is the question. Here the aircraft profile already
+            # holds a better answer than any the model will invent.
             "payload_lb": {
                 "type": "number",
                 "description": "Payload in pounds. Defaults to typical occupancy for the aircraft.",
@@ -1334,6 +1389,10 @@ def dispatch(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     missing = [n for n in tool.required_names() if n not in arguments]
     if missing:
         return {"error": f"{name} requires: {missing}."}
+
+    arguments, bad = _coerce_arguments(tool, arguments)
+    if bad:
+        return {"error": f"{name}: {bad}"}
 
     try:
         return tool.func(**arguments)

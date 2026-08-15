@@ -1,0 +1,419 @@
+"""Ollama backend -- a larger local model, and the one that drives the loop.
+
+Runs a model on this machine through Ollama's local HTTP server. Free, no
+API key, no data leaving the machine, and with a 32,768-token context
+window instead of the on-device model's 4,096. Llama 3.1 supports 128K;
+this asks for the share of it that fits comfortably in 16 GB.
+
+THE IMPORTANT DIFFERENCE FROM THE APPLE BACKEND
+-----------------------------------------------
+Apple's SDK runs the tool loop itself: you hand `LanguageModelSession` a
+list of tools, call `respond()`, and it decides, executes and returns
+only the final text. Against that backend `agent.py`'s loop makes exactly
+one pass and exits, so the orchestration written there never actually
+orchestrates.
+
+Ollama works the other way, like the Claude API. A reply comes back
+either as prose or as a list of `tool_calls` for the CALLER to execute
+and send back. So this backend is the one that exercises the hand-written
+loop -- `send_user_message` and `send_tool_results` both return, the loop
+runs the tools, and it repeats until the model stops asking.
+
+That makes this the more honest demonstration of the agent, and it is
+worth more than the extra context.
+
+WHY THE CONTEXT WINDOW HAS TO BE SET EXPLICITLY
+-----------------------------------------------
+Ollama does not give a model its advertised context by default. Older
+versions used a flat 2,048 tokens; 0.32 sizes it from available VRAM and
+reported `default_num_ctx=4096` on the machine this was written for --
+exactly the on-device model's window, and no improvement at all.
+
+Either way it truncates silently rather than erroring, so pulling a model
+advertised as 128K and quietly getting 4,096 is the trap. `DEFAULT_NUM_CTX`
+below is why this backend is an improvement rather than a wash.
+
+WHAT IS SHARED WITH EVERY OTHER BACKEND
+---------------------------------------
+The tools. `ToolSpec.json_schema()` already emits exactly the format
+Ollama wants, because that format is OpenAI's and so is Claude's. The
+tool functions, their descriptions, and `dispatch()` are untouched --
+this file converts message shapes and nothing else.
+"""
+
+import json
+from typing import Any, Dict, List, Optional, Sequence
+
+from .agent import ModelResponse, ToolCall, ToolResult
+from .tools import ToolSpec
+
+try:
+    import requests
+
+    REQUESTS_AVAILABLE = True
+except ImportError:  # pragma: no cover - requests is a project dependency
+    requests = None
+    REQUESTS_AVAILABLE = False
+
+
+DEFAULT_HOST = "http://localhost:11434"
+DEFAULT_MODEL = "llama3.1"
+
+# Ollama's own default is not the model's advertised window: 0.32 sizes
+# it from VRAM and gave 4,096 on an M3, identical to the on-device model
+# this backend exists to improve on. 32,768 is large enough that the
+# context stops shaping the design and small enough to stay comfortable
+# in 16 GB -- the full 128K would need considerably more.
+DEFAULT_NUM_CTX = 32768
+
+# Generation is slow on a laptop, and a flight plan can involve several
+# rounds. Long enough not to abandon a working answer, short enough that
+# a wedged server does not hang the CLI forever.
+REQUEST_TIMEOUT_S = 300
+
+
+class OllamaUnavailable(RuntimeError):
+    """Raised when Ollama cannot be used, with what to do about it."""
+
+
+class OllamaBackend:
+    """Drives the agent loop against a model served by Ollama.
+
+    Args:
+        model: Ollama model name, e.g. "llama3.1" or "qwen2.5".
+        host: Where the Ollama server is listening.
+        num_ctx: Context window in tokens. See DEFAULT_NUM_CTX -- leaving
+            this to Ollama's default gives no more room than the
+            on-device model, silently.
+        temperature: 0 by default. Tool selection is a decision, not a
+            creative act, and a deterministic backend is far easier to
+            debug against a scripted test.
+    """
+
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        host: str = DEFAULT_HOST,
+        num_ctx: int = DEFAULT_NUM_CTX,
+        temperature: float = 0.0,
+        session: Optional[Any] = None,
+    ):
+        if not REQUESTS_AVAILABLE:
+            raise OllamaUnavailable(
+                "The `requests` package is required.\n"
+                "Install it with:  pip install requests"
+            )
+
+        self.model = model
+        self.host = host.rstrip("/")
+        self.num_ctx = num_ctx
+        self.temperature = temperature
+        self.session = session or requests.Session()
+
+        self.name = f"ollama:{model}"
+        self.context_size = num_ctx
+
+        self._check_available()
+
+        # The whole conversation, resent on every call. Ollama is
+        # stateless per request, exactly like the Claude API -- which is
+        # why history lives here rather than in a session object as it
+        # does for Apple.
+        self.messages: List[Dict[str, Any]] = []
+        self.tool_schemas: List[Dict[str, Any]] = []
+
+        self._next_id = 0
+
+    # -- availability ----------------------------------------------------
+
+    def _check_available(self) -> None:
+        """Fail early, with the command that fixes it.
+
+        A connection error thrown from the middle of a conversation is a
+        stack trace; the same condition caught here is one line telling
+        the user to start the server. `AppleBackendUnavailable` exists
+        for the same reason.
+        """
+        try:
+            response = self.session.get(f"{self.host}/api/tags", timeout=5)
+            response.raise_for_status()
+            installed = {
+                model.get("name", "").split(":")[0]
+                for model in response.json().get("models", [])
+            }
+        except Exception as exc:  # noqa: BLE001 - any failure means unusable
+            raise OllamaUnavailable(
+                f"Cannot reach Ollama at {self.host}.\n\n"
+                "Start it with:   ollama serve\n"
+                f"Or use the on-device model:   --backend apple\n\n"
+                f"({type(exc).__name__})"
+            ) from exc
+
+        if installed and self.model.split(":")[0] not in installed:
+            raise OllamaUnavailable(
+                f"Model {self.model!r} is not installed.\n\n"
+                f"Pull it with:   ollama pull {self.model}\n"
+                f"Installed:      {', '.join(sorted(installed)) or 'none'}"
+            )
+
+    # -- ModelBackend protocol -------------------------------------------
+
+    def start(self, system_prompt: str, tools: Sequence[ToolSpec]) -> None:
+        """Begin a conversation.
+
+        `json_schema()` needs no adaptation: Ollama takes OpenAI-style
+        function schemas, and that is what ToolSpec already renders for
+        the Claude API. The neutral ToolSpec paying off exactly as
+        intended.
+        """
+        self.messages = [{"role": "system", "content": system_prompt}]
+        self.tool_schemas = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.json_schema(),
+                },
+            }
+            for tool in tools
+        ]
+
+    def send_user_message(self, text: str) -> ModelResponse:
+        self.messages.append({"role": "user", "content": text})
+        return self._chat()
+
+    def send_tool_results(self, results: Sequence[ToolResult]) -> ModelResponse:
+        """Return tool output to the model and get its next reply.
+
+        THIS METHOD IS WHY THIS BACKEND EXISTS. On the Apple backend it
+        is unreachable -- asserted so in its tests -- because Apple's
+        session runs tools internally. Here the loop in `agent.py` calls
+        it after every round, which is the loop doing its job.
+        """
+        for result in results:
+            self.messages.append(
+                {
+                    "role": "tool",
+                    "content": json.dumps(result.content),
+                    # Ollama echoes the function name rather than a call
+                    # id. Pairing is positional within a round, which is
+                    # safe here because the results are appended in the
+                    # order the calls were made -- unlike Apple, which
+                    # runs tools concurrently and needed ids.
+                    "name": result.name,
+                }
+            )
+        return self._chat()
+
+    # -- internals -------------------------------------------------------
+
+    def _chat(self) -> ModelResponse:
+        """One round trip, appending the reply to the history."""
+        payload = {
+            "model": self.model,
+            "messages": self.messages,
+            "tools": self.tool_schemas,
+            "stream": False,
+            "options": {
+                "num_ctx": self.num_ctx,
+                "temperature": self.temperature,
+            },
+        }
+
+        try:
+            response = self.session.post(
+                f"{self.host}/api/chat", json=payload, timeout=REQUEST_TIMEOUT_S
+            )
+            response.raise_for_status()
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001
+            raise OllamaUnavailable(
+                f"Ollama request failed: {type(exc).__name__}. "
+                "Is `ollama serve` still running?"
+            ) from exc
+
+        message = body.get("message", {}) or {}
+
+        # Keep the assistant turn in history exactly as it came back,
+        # tool calls included. Dropping them would leave the tool results
+        # that follow with nothing to answer.
+        #
+        # `role` is defaulted rather than assumed: every message in the
+        # history is resent on the next request, and one without a role
+        # would be rejected. Ollama supplies it, but a reply that did not
+        # would poison the conversation from that point on rather than
+        # failing where the mistake was.
+        message.setdefault("role", "assistant")
+        self.messages.append(message)
+
+        # Read the calls BEFORE the text. `_read_tool_calls` may find a
+        # call written into the content and clear it, and keyword
+        # arguments evaluate left to right -- so building the response
+        # inline would capture the raw JSON as the reply text.
+        tool_calls = self._read_tool_calls(message)
+
+        return ModelResponse(
+            text=message.get("content", "") or "",
+            tool_calls=tool_calls,
+            raw=body,
+        )
+
+    def _recover_text_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
+        """Find a tool call the model wrote out as prose instead of emitting.
+
+        THE BEHAVIOUR THIS ADAPTS TO. llama3.1 sometimes writes a call
+        into its reply text rather than sending it through the tool
+        channel:
+
+            Based on the list of business aircraft, I will plan the
+            flight from Boston to Denver in a Citation CJ2+.
+
+            {"name": "plan_flight", "parameters": {"aircraft": "cj2", ...}}
+
+        `tool_calls` is empty, so the loop sees prose, decides the model
+        is finished, and returns that JSON to the user as the answer.
+        Nothing runs. Both times it has been observed it followed a tool
+        result -- the model reads an outcome, decides on the next call,
+        and describes it.
+
+        Apple never did this because its SDK owns the loop and there is
+        no text channel for a call to leak into. It is the price of the
+        backend that lets `agent.py` drive.
+
+        Prompting against it works until the model forgets, which on an
+        8B model is a few turns. Recognising it is more reliable, and it
+        is the same principle used throughout the tools: adapt to what
+        the model actually does.
+
+        THE GUARD. Only an object whose `name` matches a tool actually
+        exposed in this conversation is accepted, so a model legitimately
+        showing JSON -- explaining a schema, quoting a result -- is not
+        executed. `{"name": "anything_else"}` is just text.
+        """
+        if not text or "{" not in text:
+            return None
+
+        known = {schema["function"]["name"] for schema in self.tool_schemas}
+
+        # Scan for balanced top-level objects rather than regex-matching:
+        # arguments are themselves nested objects, and a lazy pattern
+        # stops at the first inner brace.
+        depth = 0
+        start = -1
+        for index, character in enumerate(text):
+            if character == "{":
+                if depth == 0:
+                    start = index
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0 and start != -1:
+                    try:
+                        candidate = json.loads(text[start : index + 1])
+                    except ValueError:
+                        candidate = None
+                    if isinstance(candidate, dict) and candidate.get("name") in known:
+                        return candidate
+                    start = -1
+        return None
+
+    def _read_tool_calls(self, message: Dict[str, Any]) -> List[ToolCall]:
+        """Convert Ollama's tool calls into the loop's own type.
+
+        Arguments arrive as a dict from well-behaved models and
+        occasionally as a JSON string from less careful ones, so both are
+        accepted. A malformed one becomes an empty dict rather than an
+        exception: `dispatch()` will then answer with a readable error
+        about the missing argument, which the model can recover from --
+        the same errors-as-data reasoning used throughout the tools.
+        """
+        raw_calls = message.get("tool_calls") or []
+
+        # Nothing on the tool channel: check whether one was written into
+        # the reply text instead. See `_recover_text_tool_call`.
+        if not raw_calls:
+            recovered = self._recover_text_tool_call(message.get("content", "") or "")
+            if recovered:
+                raw_calls = [
+                    {
+                        "function": {
+                            "name": recovered.get("name", ""),
+                            # llama3.1 writes "parameters"; the tool
+                            # channel calls the same thing "arguments".
+                            "arguments": recovered.get("parameters")
+                            or recovered.get("arguments")
+                            or {},
+                        }
+                    }
+                ]
+                # The text was a call, not an answer. Leaving it in the
+                # reply would print raw JSON to the user and, worse, put
+                # it in the history as though the model had answered.
+                message["content"] = ""
+
+        calls = []
+        for raw in raw_calls:
+            function = raw.get("function", {}) or {}
+            arguments = function.get("arguments", {})
+
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except ValueError:
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+
+            self._next_id += 1
+            calls.append(
+                ToolCall(
+                    id=f"call_{self._next_id}",
+                    name=function.get("name", ""),
+                    arguments=arguments,
+                )
+            )
+        return calls
+
+    # -- diagnostics -----------------------------------------------------
+
+    def context_usage(self) -> Optional[dict]:
+        """Roughly how full the context window is, by role.
+
+        Estimated from the message JSON at four characters per token, the
+        same approximation `backend_apple` uses, so the meter reads
+        consistently whichever backend is running. It is an estimate and
+        is labelled as one wherever it is shown.
+        """
+        if not self.messages:
+            return None
+
+        by_role: Dict[str, int] = {}
+        total = 0
+
+        # The tool schemas are sent on every request and are a large
+        # fixed cost -- on the Apple backend they were a third of the
+        # window before anything was said, which is only visible if they
+        # are counted.
+        if self.tool_schemas:
+            schema_tokens = len(json.dumps(self.tool_schemas)) // 4
+            by_role["tools"] = schema_tokens
+            total += schema_tokens
+
+        for message in self.messages:
+            size = len(json.dumps(message)) // 4
+            role = message.get("role", "?")
+            by_role[role] = by_role.get(role, 0) + size
+            total += size
+
+        return {
+            "total": total,
+            "limit": self.num_ctx,
+            "percent": 100.0 * total / self.num_ctx,
+            "by_role": by_role,
+        }
+
+    def reset(self) -> None:
+        """Start a fresh conversation, keeping the system prompt."""
+        self.messages = self.messages[:1] if self.messages else []
+        self._next_id = 0
