@@ -1,8 +1,9 @@
 """Ollama backend -- a larger local model, and the one that drives the loop.
 
 Runs a model on this machine through Ollama's local HTTP server. Free, no
-API key, no data leaving the machine, and with a 128K context window
-instead of the on-device model's 4,096.
+API key, no data leaving the machine, and with a 32,768-token context
+window instead of the on-device model's 4,096. Llama 3.1 supports 128K;
+this asks for the share of it that fits comfortably in 16 GB.
 
 THE IMPORTANT DIFFERENCE FROM THE APPLE BACKEND
 -----------------------------------------------
@@ -82,8 +83,8 @@ class OllamaBackend:
         model: Ollama model name, e.g. "llama3.1" or "qwen2.5".
         host: Where the Ollama server is listening.
         num_ctx: Context window in tokens. See DEFAULT_NUM_CTX -- leaving
-            this to Ollama's default would make the window smaller than
-            Apple's.
+            this to Ollama's default gives no more room than the
+            on-device model, silently.
         temperature: 0 by default. Tool selection is a decision, not a
             creative act, and a deterministic backend is far easier to
             debug against a scripted test.
