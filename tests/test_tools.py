@@ -460,8 +460,28 @@ class TestPlanFlight(unittest.TestCase):
         self.assertIn("useful load", result["error"])
 
     def test_altitude_above_ceiling_is_refused(self):
-        result = self.plan(aircraft="c172", altitude_ft=45000)
+        # Reached directly rather than through dispatch(): the CLI can
+        # still pass an altitude, but it is no longer a tool parameter,
+        # so a model cannot.
+        from flight_dispatch.tools import plan_flight
+
+        result = plan_flight(
+            origin="KPWK", dest="KMSP", aircraft="c172",
+            altitude_ft=45000, use_wind=False,
+        )
         self.assertIn("service ceiling", result["error"])
+
+    def test_a_model_cannot_set_a_cruise_altitude(self):
+        # Models volunteer one nobody asked for, and pick badly: 30,000
+        # ft for a 737 that cruises at 35,000, then the same 30,000 for a
+        # Cessna 172 with a 14,000 ft ceiling, then again for a Cirrus
+        # that tops out at 17,500.
+        result = dispatch(
+            "plan_flight",
+            {"origin": "KPWK", "dest": "KMSP", "altitude_ft": 30000},
+        )
+        self.assertIn("altitude_ft", result["error"])
+        self.assertIn("accepted_arguments", result)
 
     def test_reports_whether_wind_was_applied(self):
         self.assertFalse(self.plan()["wind_applied"])
@@ -834,3 +854,109 @@ class TestSpokenDuration(unittest.TestCase):
         )
         self.assertIn("hours", result["range_warning"])
         self.assertNotIn("h02m", result["range_warning"])
+
+
+class TestArgumentCoercion(unittest.TestCase):
+    """THE CRASH THIS PREVENTS.
+
+    Ollama sends numbers and booleans as strings. `payload_lb='300'`
+    reached the weight arithmetic as text and raised
+    `TypeError: unsupported operand type(s) for -: 'float' and 'str'`.
+
+    `avoid_airspace='true'` did NOT raise, which is worse: a non-empty
+    string is truthy, so `'false'` would have been truthy too and quietly
+    turned airspace avoidance on when the model asked for it off.
+
+    A backend that stringifies is not misbehaving -- JSON has no way to
+    say "this string is a number" -- so this is handled once in
+    dispatch(), where every tool and every future backend inherits it.
+    """
+
+    def test_a_stringified_number_is_accepted(self):
+        result = dispatch(
+            "plan_flight",
+            {
+                "origin": "KPWK",
+                "dest": "KMSP",
+                "aircraft": "sr22",
+                "payload_lb": "300",
+                "use_wind": False,
+            },
+        )
+        self.assertNotIn("error", result)
+
+    def test_a_stringified_true_is_a_boolean(self):
+        result = dispatch(
+            "plan_flight",
+            {
+                "origin": "KPWK",
+                "dest": "KMSP",
+                "aircraft": "sr22",
+                "use_wind": "false",
+                "avoid_airspace": "false",
+            },
+        )
+        self.assertFalse(result["wind_applied"])
+        self.assertIn("NOT CHECKED", result["restricted_airspace"])
+
+    def test_a_stringified_false_is_not_truthy(self):
+        # The bug a bare `if value:` would have: 'false' is a non-empty
+        # string, so airspace avoidance would have stayed on.
+        from flight_dispatch.tools import TOOLS_BY_NAME, _coerce_arguments
+
+        converted, error = _coerce_arguments(
+            TOOLS_BY_NAME["plan_flight"], {"avoid_airspace": "false"}
+        )
+        self.assertEqual(error, "")
+        self.assertIs(converted["avoid_airspace"], False)
+
+    def test_boolean_words(self):
+        from flight_dispatch.tools import TOOLS_BY_NAME, _coerce_arguments
+
+        tool = TOOLS_BY_NAME["plan_flight"]
+        for text, expected in (
+            ("true", True), ("True", True), ("yes", True), ("1", True),
+            ("false", False), ("FALSE", False), ("no", False), ("0", False),
+        ):
+            converted, error = _coerce_arguments(tool, {"use_wind": text})
+            self.assertEqual(error, "", text)
+            self.assertIs(converted["use_wind"], expected, text)
+
+    def test_real_types_pass_through_untouched(self):
+        from flight_dispatch.tools import TOOLS_BY_NAME, _coerce_arguments
+
+        given = {"payload_lb": 300.0, "use_wind": True, "origin": "KPWK"}
+        converted, error = _coerce_arguments(TOOLS_BY_NAME["plan_flight"], given)
+        self.assertEqual(error, "")
+        self.assertEqual(converted, given)
+
+    def test_nonsense_is_an_error_the_model_can_read(self):
+        result = dispatch(
+            "plan_flight",
+            {"origin": "KPWK", "dest": "KMSP", "payload_lb": "heavy"},
+        )
+        self.assertIn("not a number", result["error"])
+
+    def test_nonsense_boolean_is_an_error_not_a_guess(self):
+        result = dispatch(
+            "plan_flight",
+            {"origin": "KPWK", "dest": "KMSP", "use_wind": "maybe"},
+        )
+        self.assertIn("not true or false", result["error"])
+
+    def test_strings_are_left_alone(self):
+        from flight_dispatch.tools import TOOLS_BY_NAME, _coerce_arguments
+
+        converted, _ = _coerce_arguments(
+            TOOLS_BY_NAME["find_airport"], {"query": "300"}
+        )
+        self.assertEqual(converted["query"], "300")
+
+    def test_winds_altitude_still_takes_its_enum_strings(self):
+        # get_winds_aloft's altitude is a string enum by design, and must
+        # not be mangled by number coercion.
+        result = dispatch(
+            "get_winds_aloft",
+            {"latitude": 39.86, "longitude": -104.67, "altitude_ft": "34000"},
+        )
+        self.assertEqual(result["altitude_ft"], 34000.0)
