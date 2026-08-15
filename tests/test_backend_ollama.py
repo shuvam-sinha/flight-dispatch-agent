@@ -387,3 +387,108 @@ class TestContextMeter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTextTypedToolCalls(unittest.TestCase):
+    """llama3.1 sometimes writes a call into its reply instead of
+    emitting it.
+
+    Observed twice, both times immediately after a tool result: the model
+    reads an outcome, decides on the next call, and describes it. The
+    tool channel is empty, so the loop sees prose, concludes the model is
+    finished, and hands raw JSON to the user as the answer. Nothing runs.
+    """
+
+    def response_for(self, content, tools=("plan_flight", "list_aircraft")):
+        source = backend()
+        source.session.replies = [{"content": content}]
+        source.start("test", [TOOLS_BY_NAME[name] for name in tools])
+        return source, source.send_user_message("hi")
+
+    def test_a_written_call_is_recovered(self):
+        _, reply = self.response_for(
+            'I will plan that now.\n\n'
+            '{"name": "plan_flight", "parameters": '
+            '{"origin": "KBOS", "dest": "KDEN", "aircraft": "cj2"}}'
+        )
+        self.assertTrue(reply.wants_tools)
+        self.assertEqual(reply.tool_calls[0].name, "plan_flight")
+        self.assertEqual(reply.tool_calls[0].arguments["aircraft"], "cj2")
+
+    def test_the_json_is_not_shown_as_the_answer(self):
+        _, reply = self.response_for(
+            '{"name": "plan_flight", "parameters": {"origin": "KBOS", "dest": "KDEN"}}'
+        )
+        self.assertNotIn("plan_flight", reply.text)
+
+    def test_history_does_not_keep_the_json_as_a_reply(self):
+        # Left in place it would sit in the transcript as though the
+        # model had answered, and the next turn would build on it.
+        source, _ = self.response_for(
+            '{"name": "plan_flight", "parameters": {"origin": "KBOS", "dest": "KDEN"}}'
+        )
+        self.assertEqual(source.messages[-1]["content"], "")
+
+    def test_nested_arguments_survive(self):
+        # A lazy regex would stop at the first inner closing brace.
+        _, reply = self.response_for(
+            '{"name": "plan_flight", "parameters": {"origin": "KBOS", '
+            '"dest": "KDEN", "aircraft": "cj2", "use_wind": "true"}}'
+        )
+        self.assertEqual(len(reply.tool_calls[0].arguments), 4)
+
+    def test_arguments_key_is_also_accepted(self):
+        # llama3.1 writes "parameters"; the tool channel calls the same
+        # thing "arguments".
+        _, reply = self.response_for(
+            '{"name": "list_aircraft", "arguments": {"category": "business"}}'
+        )
+        self.assertEqual(reply.tool_calls[0].arguments["category"], "business")
+
+    def test_unknown_tool_names_are_left_as_prose(self):
+        # The guard against executing JSON the model was merely showing.
+        _, reply = self.response_for('{"name": "launch_missiles", "parameters": {}}')
+        self.assertFalse(reply.wants_tools)
+        self.assertIn("launch_missiles", reply.text)
+
+    def test_ordinary_prose_is_untouched(self):
+        _, reply = self.response_for("KORD is Chicago O'Hare International Airport.")
+        self.assertFalse(reply.wants_tools)
+        self.assertIn("O'Hare", reply.text)
+
+    def test_json_that_is_not_a_call_is_untouched(self):
+        _, reply = self.response_for('The result was {"icao": "KORD", "elevation": 680}.')
+        self.assertFalse(reply.wants_tools)
+        self.assertIn("KORD", reply.text)
+
+    def test_malformed_json_is_left_as_prose(self):
+        _, reply = self.response_for('{"name": "plan_flight", "parameters":')
+        self.assertFalse(reply.wants_tools)
+
+    def test_a_real_tool_call_takes_precedence(self):
+        # Recovery only runs when the tool channel is empty.
+        source = backend()
+        source.session.replies = [
+            {
+                "content": '{"name": "list_aircraft", "parameters": {}}',
+                "tool_calls": [
+                    {"function": {"name": "plan_flight", "arguments": {"origin": "KBOS"}}}
+                ],
+            }
+        ]
+        source.start("test", [TOOLS_BY_NAME["plan_flight"], TOOLS_BY_NAME["list_aircraft"]])
+        reply = source.send_user_message("hi")
+        self.assertEqual(len(reply.tool_calls), 1)
+        self.assertEqual(reply.tool_calls[0].name, "plan_flight")
+
+    def test_the_loop_runs_a_recovered_call(self):
+        # End to end: the failure was that nothing ran at all.
+        source = backend()
+        source.session.replies = [
+            {"content": '{"name": "find_airport", "parameters": {"query": "KORD"}}'},
+            {"content": "KORD is Chicago O'Hare."},
+        ]
+        agent = DispatcherAgent(source, tools=[TOOLS_BY_NAME["find_airport"]])
+        turn = agent.ask("what is KORD")
+        self.assertEqual(len(turn.tool_calls), 1)
+        self.assertEqual(turn.tool_results[0].content["icao"], "KORD")

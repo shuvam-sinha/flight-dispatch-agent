@@ -217,11 +217,33 @@ class TestRateLimitBackoff(unittest.TestCase):
         response = self.FakeResponse(headers={"Retry-After": "soon"})
         self.assertGreater(self.source()._retry_wait(response, 0), 0)
 
-    def test_other_limits_back_off_exponentially(self):
-        response = self.FakeResponse(payload={"reason": "Hourly limit exceeded."})
+    def test_an_unexplained_refusal_backs_off_exponentially(self):
+        response = self.FakeResponse(payload={"reason": "Too many requests."})
         wait_first = self.source()._retry_wait(response, 0)
         wait_later = self.source()._retry_wait(response, 2)
         self.assertLess(wait_first, wait_later)
+
+    def test_a_daily_cap_is_not_retried(self):
+        # THE WASTE THIS AVOIDS. The free tier caps by minute, hour and
+        # day. A minute is worth sleeping through; a day cannot be waited
+        # out inside one request, and retrying only spends six seconds of
+        # backoff per batch before failing anyway. None means stop.
+        response = self.FakeResponse(
+            payload={"reason": "Daily API request limit exceeded. "
+                               "Please try again tomorrow."}
+        )
+        self.assertIsNone(self.source()._retry_wait(response, 0))
+
+    def test_an_hourly_cap_is_not_retried(self):
+        response = self.FakeResponse(payload={"reason": "Hourly limit exceeded."})
+        self.assertIsNone(self.source()._retry_wait(response, 0))
+
+    def test_a_minutely_cap_is_still_retried(self):
+        # The distinction has to cut both ways or it is just a refusal.
+        response = self.FakeResponse(
+            payload={"reason": "Minutely API request limit exceeded."}
+        )
+        self.assertIsNotNone(self.source()._retry_wait(response, 0))
 
     def test_never_sleeps_longer_than_the_cap(self):
         from flight_dispatch.wind_openmeteo import MAX_RETRY_WAIT_S
@@ -267,3 +289,95 @@ class TestRequestCost(unittest.TestCase):
         display = self.captured_params()["hourly"].split(",")
         self.assertEqual(len(routing), 2)
         self.assertEqual(len(display), 3)
+
+
+class TestQuotaBudget(unittest.TestCase):
+    """Open-Meteo meters work, not requests: roughly locations x
+    variables x days, against ~600 units per minute on the free tier.
+
+    A fixed grid resolution therefore fails on long routes -- at 0.5
+    degrees a transcontinental plan wanted ~1,936 units and exhausted the
+    minute by itself, so the flights where wind matters most were the
+    ones that never got any. The cell count is capped instead, and the
+    resolution follows.
+    """
+
+    def source(self, **kwargs):
+        from flight_dispatch.wind_openmeteo import OpenMeteoWindSource
+
+        return OpenMeteoWindSource(**kwargs)
+
+    def corridor(self, span_deg, step=0.25, width_deg=6.0):
+        """A band of points along a diagonal, like a real mesh.
+
+        Width matters: a route's waypoints spread either side of the
+        course, and it is the AREA that sets the cell count. A
+        one-cell-wide line would never coarsen however long it got.
+        """
+        points = []
+        count = int(span_deg / step)
+        offsets = [-width_deg, -width_deg / 2, 0.0, width_deg / 2, width_deg]
+        for i in range(count):
+            lat = 40.0 + i * step
+            lon = -80.0 - i * step
+            for offset in offsets:
+                points.append((lat + offset, lon))
+        return points
+
+    def test_a_short_route_keeps_the_fine_grid(self):
+        from flight_dispatch.wind_openmeteo import DEFAULT_SNAP_DEG
+
+        source = self.source()
+        self.assertEqual(
+            source._resolution_for(self.corridor(5)), DEFAULT_SNAP_DEG
+        )
+
+    def test_a_long_route_coarsens(self):
+        from flight_dispatch.wind_openmeteo import DEFAULT_SNAP_DEG
+
+        source = self.source()
+        self.assertGreater(
+            source._resolution_for(self.corridor(60)), DEFAULT_SNAP_DEG
+        )
+
+    def test_the_cell_count_stays_within_budget(self):
+        # Or, for a route so large that even the coarsest useful grid
+        # cannot fit it, the resolution has bottomed out at MAX_SNAP_DEG.
+        # Sampling further apart than that cannot describe a jet stream,
+        # and a wrong wind is worse than a slow one.
+        from flight_dispatch.wind_openmeteo import (
+            MAX_SNAP_DEG,
+            TARGET_CELLS_PER_PLAN,
+        )
+
+        source = self.source()
+        for span in (5, 20, 60, 120, 400):
+            points = self.corridor(span)
+            degrees = source._resolution_for(points)
+            cells = {
+                (round(a / degrees) * degrees, round(b / degrees) * degrees)
+                for a, b in points
+            }
+            within = len(cells) <= TARGET_CELLS_PER_PLAN
+            self.assertTrue(within or degrees == MAX_SNAP_DEG, span)
+
+    def test_resolution_never_exceeds_the_useful_limit(self):
+        from flight_dispatch.wind_openmeteo import MAX_SNAP_DEG
+
+        source = self.source()
+        # Samples further apart than this cannot describe a jet stream.
+        self.assertLessEqual(source._resolution_for(self.corridor(400)), MAX_SNAP_DEG)
+
+    def test_prefetch_fixes_the_resolution_for_the_whole_plan(self):
+        # The cache is keyed by snapped coordinate, so coarsening after
+        # some cells were fetched at a finer grid would strand them and
+        # every later lookup would miss.
+        from unittest.mock import patch
+
+        source = self.source()
+        with patch.object(source, "_fetch_batch"):
+            source.prefetch(self.corridor(60), 35000)
+        chosen = source.snap_deg
+        with patch.object(source, "_fetch_batch"):
+            source.wind_at_many(self.corridor(60), 35000)
+        self.assertEqual(source.snap_deg, chosen)

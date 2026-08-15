@@ -247,11 +247,76 @@ class OllamaBackend:
         message.setdefault("role", "assistant")
         self.messages.append(message)
 
+        # Read the calls BEFORE the text. `_read_tool_calls` may find a
+        # call written into the content and clear it, and keyword
+        # arguments evaluate left to right -- so building the response
+        # inline would capture the raw JSON as the reply text.
+        tool_calls = self._read_tool_calls(message)
+
         return ModelResponse(
             text=message.get("content", "") or "",
-            tool_calls=self._read_tool_calls(message),
+            tool_calls=tool_calls,
             raw=body,
         )
+
+    def _recover_text_tool_call(self, text: str) -> Optional[Dict[str, Any]]:
+        """Find a tool call the model wrote out as prose instead of emitting.
+
+        THE BEHAVIOUR THIS ADAPTS TO. llama3.1 sometimes writes a call
+        into its reply text rather than sending it through the tool
+        channel:
+
+            Based on the list of business aircraft, I will plan the
+            flight from Boston to Denver in a Citation CJ2+.
+
+            {"name": "plan_flight", "parameters": {"aircraft": "cj2", ...}}
+
+        `tool_calls` is empty, so the loop sees prose, decides the model
+        is finished, and returns that JSON to the user as the answer.
+        Nothing runs. Both times it has been observed it followed a tool
+        result -- the model reads an outcome, decides on the next call,
+        and describes it.
+
+        Apple never did this because its SDK owns the loop and there is
+        no text channel for a call to leak into. It is the price of the
+        backend that lets `agent.py` drive.
+
+        Prompting against it works until the model forgets, which on an
+        8B model is a few turns. Recognising it is more reliable, and it
+        is the same principle used throughout the tools: adapt to what
+        the model actually does.
+
+        THE GUARD. Only an object whose `name` matches a tool actually
+        exposed in this conversation is accepted, so a model legitimately
+        showing JSON -- explaining a schema, quoting a result -- is not
+        executed. `{"name": "anything_else"}` is just text.
+        """
+        if not text or "{" not in text:
+            return None
+
+        known = {schema["function"]["name"] for schema in self.tool_schemas}
+
+        # Scan for balanced top-level objects rather than regex-matching:
+        # arguments are themselves nested objects, and a lazy pattern
+        # stops at the first inner brace.
+        depth = 0
+        start = -1
+        for index, character in enumerate(text):
+            if character == "{":
+                if depth == 0:
+                    start = index
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0 and start != -1:
+                    try:
+                        candidate = json.loads(text[start : index + 1])
+                    except ValueError:
+                        candidate = None
+                    if isinstance(candidate, dict) and candidate.get("name") in known:
+                        return candidate
+                    start = -1
+        return None
 
     def _read_tool_calls(self, message: Dict[str, Any]) -> List[ToolCall]:
         """Convert Ollama's tool calls into the loop's own type.
@@ -263,8 +328,32 @@ class OllamaBackend:
         about the missing argument, which the model can recover from --
         the same errors-as-data reasoning used throughout the tools.
         """
+        raw_calls = message.get("tool_calls") or []
+
+        # Nothing on the tool channel: check whether one was written into
+        # the reply text instead. See `_recover_text_tool_call`.
+        if not raw_calls:
+            recovered = self._recover_text_tool_call(message.get("content", "") or "")
+            if recovered:
+                raw_calls = [
+                    {
+                        "function": {
+                            "name": recovered.get("name", ""),
+                            # llama3.1 writes "parameters"; the tool
+                            # channel calls the same thing "arguments".
+                            "arguments": recovered.get("parameters")
+                            or recovered.get("arguments")
+                            or {},
+                        }
+                    }
+                ]
+                # The text was a call, not an answer. Leaving it in the
+                # reply would print raw JSON to the user and, worse, put
+                # it in the history as though the model had answered.
+                message["content"] = ""
+
         calls = []
-        for raw in message.get("tool_calls") or []:
+        for raw in raw_calls:
             function = raw.get("function", {}) or {}
             arguments = function.get("arguments", {})
 

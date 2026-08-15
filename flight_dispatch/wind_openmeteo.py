@@ -24,7 +24,9 @@ The underlying model resolution is coarser than the snap grid anyway
 information.
 """
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -46,6 +48,42 @@ DEFAULT_SNAP_DEG = 0.5
 MAX_POINTS_PER_REQUEST = 50
 
 REQUEST_TIMEOUT_S = 30
+
+# Grid cells one plan may ask for. THE LIMIT THIS RESPECTS: Open-Meteo
+# meters work, not requests -- roughly locations x variables x days --
+# against about 600 units per minute on the free tier. At two variables
+# per cell, 250 cells is ~500 units, comfortably inside it.
+#
+# WHY THIS HAS TO BE A CAP AND NOT A FIXED RESOLUTION. Cost scales with
+# route length, so any fixed snap eventually exceeds the quota:
+#
+#     route          0.5 deg      1.0 deg      2.0 deg
+#     KPWK-KMSP     168 cells     64 cells     26 cells
+#     KBOS-KDEN     562          244           92
+#     KJFK-KLAX     968          422          148
+#
+# At 0.5 degrees a transcontinental plan wanted ~1,936 units and simply
+# could not be served: it exhausted the minute by itself, every retry hit
+# the same wall, and the route came back "winds unavailable". Boston to
+# Denver failed the same way. The routes where wind matters most were the
+# ones that never got any.
+#
+# Capping the cells instead means short routes keep fine resolution and
+# long ones coarsen -- which is also the honest trade. Wind fields are
+# smooth, a 2,000 nm route sampled every 2 degrees still has ~30 samples
+# along it, and no flight plan turns on the difference between two points
+# 60 nm apart at cruise level.
+TARGET_CELLS_PER_PLAN = 250
+
+# Coarsest grid worth using. Beyond this the samples are too far apart to
+# describe a jet stream, and a wrong wind is worse than a known-absent
+# one -- better to spend the quota and be slow.
+MAX_SNAP_DEG = 2.0
+
+# Batches are independent, so they are fetched concurrently. Four is
+# enough to hide the latency of a slow response without arriving as a
+# burst that reads like abuse.
+MAX_CONCURRENT_REQUESTS = 4
 
 # A burst of batched requests can trip the free tier's rate limit. Retry
 # with backoff rather than failing the whole flight plan over it.
@@ -113,6 +151,11 @@ class OpenMeteoWindSource:
         self.rate_limit_hits = 0
         self.service_busy_hits = 0
 
+        # Batches are fetched concurrently, so the cache and the counters
+        # are written from several threads. Dict assignment is atomic in
+        # CPython, but `x += 1` is not -- it reads, adds and writes.
+        self._lock = threading.Lock()
+
     # -- public interface ------------------------------------------------
 
     def wind_at(self, lat: float, lon: float, altitude_ft: float) -> Wind:
@@ -130,8 +173,20 @@ class OpenMeteoWindSource:
         missing = sorted({p for p in snapped if (p[0], p[1], level) not in self._cache})
         self.cache_hits += len(snapped) - len(missing)
 
-        for start in range(0, len(missing), MAX_POINTS_PER_REQUEST):
-            self._fetch_batch(missing[start : start + MAX_POINTS_PER_REQUEST], level)
+        batches = [
+            missing[start : start + MAX_POINTS_PER_REQUEST]
+            for start in range(0, len(missing), MAX_POINTS_PER_REQUEST)
+        ]
+
+        # Concurrent, because the batches are independent and the wait is
+        # entirely network. Serially, a slow afternoon at Open-Meteo --
+        # five seconds a call rather than under one -- turned a
+        # transcontinental plan into a minutes-long stall.
+        if len(batches) > 1:
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as pool:
+                list(pool.map(lambda batch: self._fetch_batch(batch, level), batches))
+        elif batches:
+            self._fetch_batch(batches[0], level)
 
         return [
             self._cache.get(
@@ -150,8 +205,34 @@ class OpenMeteoWindSource:
         edge-cost function afterwards runs entirely from cache. Without
         it, the first mesh build would issue requests from inside a tight
         loop.
+
+        This is also where the grid resolution is chosen, because it is
+        the only moment the whole route is visible at once. Coarsening
+        after some cells were fetched at a finer grid would strand them:
+        the cache is keyed by snapped coordinate, so every later lookup
+        would miss.
         """
+        self.snap_deg = self._resolution_for(points)
         self.wind_at_many(points, altitude_ft)
+
+    def _resolution_for(self, points: Sequence[Tuple[float, float]]) -> float:
+        """The finest grid whose cell count fits inside the quota.
+
+        Doubles from the configured resolution -- 0.5, 1, 2 -- so the
+        values stay round and a short route keeps the fine grid it can
+        afford. See TARGET_CELLS_PER_PLAN for why a cap is needed rather
+        than a fixed resolution.
+        """
+        degrees = self.snap_deg
+        while degrees < MAX_SNAP_DEG:
+            cells = {
+                (round(lat / degrees) * degrees, round(lon / degrees) * degrees)
+                for lat, lon in points
+            }
+            if len(cells) <= TARGET_CELLS_PER_PLAN:
+                return degrees
+            degrees *= 2
+        return min(degrees, MAX_SNAP_DEG)
 
     # -- internals -------------------------------------------------------
 
@@ -208,19 +289,29 @@ class OpenMeteoWindSource:
         if payload is None:
             return
 
-        self.requests_made += 1
-
         # A single-coordinate request returns one object; a multi-
         # coordinate request returns a list. Normalise to a list.
         entries = payload if isinstance(payload, list) else [payload]
+
+        with self._lock:
+            self.requests_made += 1
 
         for (lat, lon), entry in zip(points, entries):
             wind = self._parse_entry(entry, level)
             if wind is not None:
                 self._cache[(lat, lon, level)] = wind
-                self.points_fetched += 1
+                with self._lock:
+                    self.points_fetched += 1
 
-    def _retry_wait(self, response, attempt: int) -> float:
+    @staticmethod
+    def _limit_reason(response) -> str:
+        """The server's own explanation for a refusal, lowercased."""
+        try:
+            return str(response.json().get("reason", "")).lower()
+        except ValueError:
+            return (response.text or "").lower()
+
+    def _retry_wait(self, response, attempt: int) -> Optional[float]:
         """How long to wait after a 429.
 
         THE BUG THIS FIXES. The backoff was 2s, then 4s, then give up --
@@ -233,6 +324,16 @@ class OpenMeteoWindSource:
         from the message. When the server says the window is a minute,
         wait for the minute.
         """
+        reason = self._limit_reason(response)
+
+        # SOME LIMITS CANNOT BE WAITED OUT INSIDE ONE REQUEST. The free
+        # tier caps by minute, hour and day, and the server names which
+        # in its reason. A minute is worth sleeping through; an hour or a
+        # day is not, and retrying only adds six seconds of pointless
+        # backoff per batch before failing anyway. None means stop.
+        if "daily" in reason or "hourly" in reason:
+            return None
+
         header = response.headers.get("Retry-After")
         if header:
             try:
@@ -240,12 +341,7 @@ class OpenMeteoWindSource:
             except ValueError:
                 pass
 
-        try:
-            reason = response.json().get("reason", "")
-        except ValueError:
-            reason = response.text or ""
-
-        if "minute" in reason.lower():
+        if "minute" in reason:
             return MINUTELY_RESET_S
 
         return min(RETRY_BACKOFF_S * (2**attempt), MAX_RETRY_WAIT_S)
@@ -279,12 +375,22 @@ class OpenMeteoWindSource:
                     last_error = requests.HTTPError(
                         f"{response.status_code} from Open-Meteo"
                     )
-                    if response.status_code == 429:
-                        self.rate_limit_hits += 1
-                    else:
-                        self.service_busy_hits += 1
+                    with self._lock:
+                        if response.status_code == 429:
+                            self.rate_limit_hits += 1
+                        else:
+                            self.service_busy_hits += 1
+                    wait = self._retry_wait(response, attempt)
+                    if wait is None:
+                        # An hourly or daily cap. Say which, since
+                        # "try again tomorrow" is actionable and
+                        # "HTTPError" is not.
+                        last_error = requests.HTTPError(
+                            self._limit_reason(response) or "quota exceeded"
+                        )
+                        break
                     if attempt < MAX_RETRIES - 1:
-                        time.sleep(self._retry_wait(response, attempt))
+                        time.sleep(wait)
                         continue
                     break
 
@@ -300,13 +406,13 @@ class OpenMeteoWindSource:
 
         if not self.offline_ok:
             raise WindDataError(
-                f"Could not fetch winds from Open-Meteo after "
-                f"{MAX_RETRIES} attempts: {type(last_error).__name__}"
+                f"Could not fetch winds from Open-Meteo: {last_error}"
             ) from last_error
 
         # Degraded mode: leave the cache empty so lookups fall back to
         # calm air, and record that the data is not real.
-        self.degraded = True
+        with self._lock:
+            self.degraded = True
         return None
 
     def _forecast_index(self, hourly: dict) -> int:

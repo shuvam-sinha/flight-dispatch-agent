@@ -955,8 +955,19 @@ class TestArgumentCoercion(unittest.TestCase):
     def test_winds_altitude_still_takes_its_enum_strings(self):
         # get_winds_aloft's altitude is a string enum by design, and must
         # not be mangled by number coercion.
-        result = dispatch(
-            "get_winds_aloft",
-            {"latitude": 39.86, "longitude": -104.67, "altitude_ft": "34000"},
-        )
+        #
+        # Stubbed rather than live: this asserts argument handling, and a
+        # rate-limited weather API is not a reason for it to fail.
+        from unittest.mock import patch
+
+        from flight_dispatch.wind import Wind
+
+        stub = Wind(direction_deg=223.0, speed_kt=26.0, altitude_ft=0.0,
+                    temperature_c=-41.0)
+        with patch("flight_dispatch.wind_openmeteo.OpenMeteoWindSource") as source:
+            source.return_value.wind_at.return_value = stub
+            result = dispatch(
+                "get_winds_aloft",
+                {"latitude": 39.86, "longitude": -104.67, "altitude_ft": "34000"},
+            )
         self.assertEqual(result["altitude_ft"], 34000.0)
