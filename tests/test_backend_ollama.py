@@ -104,8 +104,9 @@ class TestAvailability(unittest.TestCase):
 
 
 class TestContextWindow(unittest.TestCase):
-    """Ollama defaults num_ctx to 2,048 -- smaller than the on-device
-    model this backend exists to improve on -- and truncates silently."""
+    """Ollama does not give a model its advertised window by default:
+    0.32 sizes it from VRAM and reported 4,096 on an M3, identical to the
+    on-device model. It truncates silently, so this must be explicit."""
 
     def test_context_is_set_explicitly_and_is_large(self):
         self.assertGreaterEqual(DEFAULT_NUM_CTX, 32768)

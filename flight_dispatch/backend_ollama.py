@@ -23,10 +23,14 @@ worth more than the extra context.
 
 WHY THE CONTEXT WINDOW HAS TO BE SET EXPLICITLY
 -----------------------------------------------
-Ollama defaults `num_ctx` to 2,048 tokens -- SMALLER than Apple's 4,096 --
-and silently truncates rather than erroring. Pulling a model advertised
-as 128K and getting 2,048 is a trap worth naming: `DEFAULT_NUM_CTX` below
-is why this backend is an improvement rather than a regression.
+Ollama does not give a model its advertised context by default. Older
+versions used a flat 2,048 tokens; 0.32 sizes it from available VRAM and
+reported `default_num_ctx=4096` on the machine this was written for --
+exactly the on-device model's window, and no improvement at all.
+
+Either way it truncates silently rather than erroring, so pulling a model
+advertised as 128K and quietly getting 4,096 is the trap. `DEFAULT_NUM_CTX`
+below is why this backend is an improvement rather than a wash.
 
 WHAT IS SHARED WITH EVERY OTHER BACKEND
 ---------------------------------------
@@ -54,11 +58,11 @@ except ImportError:  # pragma: no cover - requests is a project dependency
 DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "llama3.1"
 
-# Ollama's own default is 2,048, which is smaller than the on-device
-# model this backend exists to improve on, and it truncates silently.
-# 32,768 is large enough that the context stops shaping the design and
-# small enough to stay comfortable in 16 GB of RAM -- the full 128K would
-# need considerably more.
+# Ollama's own default is not the model's advertised window: 0.32 sizes
+# it from VRAM and gave 4,096 on an M3, identical to the on-device model
+# this backend exists to improve on. 32,768 is large enough that the
+# context stops shaping the design and small enough to stay comfortable
+# in 16 GB -- the full 128K would need considerably more.
 DEFAULT_NUM_CTX = 32768
 
 # Generation is slow on a laptop, and a flight plan can involve several
