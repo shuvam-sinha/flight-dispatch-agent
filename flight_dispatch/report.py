@@ -67,6 +67,7 @@ class DispatchReport:
     checklist: List[ChecklistItem] = field(default_factory=list)
     rejected: List[str] = field(default_factory=list)
     sources: List[Dict[str, str]] = field(default_factory=list)
+    figures: Dict[str, Any] = field(default_factory=dict)
     briefing: str = ""
     generated_at: str = ""
 
@@ -160,6 +161,7 @@ class DispatchReport:
             for item in self.checklist
         ]
         report["sources"] = self.sources
+        report["figures"] = self.figures
 
         # THE HONEST FIELD. Present even when empty, so its absence never
         # means "nothing was rejected" by accident.
@@ -272,6 +274,7 @@ def build_report(
     procedures: Optional[Sequence[Dict[str, Any]]] = None,
     briefing: str = "",
     index=None,
+    figures: Optional[Dict[str, Any]] = None,
 ) -> DispatchReport:
     """Assemble a report from a plan and whatever the agent produced.
 
@@ -296,6 +299,7 @@ def build_report(
         checklist=items,
         rejected=rejected,
         sources=sources,
+        figures=dict(figures or {}),
         briefing=briefing,
     )
 
@@ -355,6 +359,34 @@ footer { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid #e3e7eb;
   details p { color: #c3ccd6; }
 }
 """
+
+
+_FIGURE_UNITS = {
+    "gal": ("fuel", "reserve"),
+    "lb": ("load", "payload", "weight"),
+    "ft": ("altitude", "ceiling", "elevation"),
+    "nm": ("distance", "range"),
+    "h": ("hours",),
+    "min": ("minutes",),
+}
+
+
+def _label(key: str) -> str:
+    """A field name as a heading a person would write."""
+    return key.replace("_", " ").replace(" ft", "").replace(" gal", "").replace(
+        " lb", ""
+    ).replace(" nm", "").replace(" hours", "").replace(" minutes", "").strip().capitalize()
+
+
+def _figure(key: str, value: Any) -> str:
+    """A number with the unit its field name implies."""
+    if not isinstance(value, (int, float)):
+        return str(value)
+
+    for unit, markers in _FIGURE_UNITS.items():
+        if any(marker in key for marker in markers):
+            return f"{value:,g} {unit}"
+    return f"{value:,g}"
 
 
 def _stat(label: str, value: str) -> str:
@@ -436,6 +468,25 @@ def _render_html(data: Dict[str, Any], map_html: str) -> str:
             '<div class="warn">These items were produced without citing any '
             "procedure in the corpus, so they are not part of the checklist "
             f"above.<ul>{rows}</ul></div>",
+        ]
+
+    # RENDERED HERE BECAUSE THE MODEL WOULD NOT USE THEM. find_procedures
+    # returns these alongside the procedures precisely so a rule can be
+    # anchored to this flight -- "carry 45 minutes of reserve, which is
+    # 1,852 gal against 47,890 of capacity". Handed the numbers, an 8B
+    # model quoted the documents verbatim and used none of them.
+    #
+    # So the report does it instead. Deterministic, and the flight-
+    # specific half of the checklist stops depending on the model
+    # noticing a field.
+    if data.get("figures"):
+        cells = "".join(
+            _stat(_label(key), _figure(key, value))
+            for key, value in data["figures"].items()
+        )
+        sections += [
+            "<h2>Figures for this aircraft and route</h2>",
+            f'<div class="grid">{cells}</div>',
         ]
 
     if data["sources"]:

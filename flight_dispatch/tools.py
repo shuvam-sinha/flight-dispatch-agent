@@ -736,10 +736,9 @@ def plan_flight(
         # The other instruction-bearing fields are all `*_note` and none
         # of them leaked. A reader treats a field named like data as data
         # and a field named like a note as a note, and so does the model.
-        result["waypoints_note"] = (
-            f"{len(plan.waypoints)} waypoints -- per-leg detail omitted to stay "
-            "within context. Report the route string and the totals; offer the "
-            "map for detail."
+        result["_waypoints_note"] = (
+            "Per-leg detail omitted to stay within context. Report the route "
+            "string and the totals; offer the map for detail."
         )
 
     # A SENTENCE, NOT A COUNT. This previously returned two fields --
@@ -866,25 +865,21 @@ def plan_flight(
                 f"Too short to reach the planned cruise level -- the flight "
                 f"tops out around {phases.cruise_altitude_ft:,.0f} ft."
             )
-        # THE REMINDER GOES WHERE THE FAILURE HAPPENED. Asked to "plan a
-        # flight from KSFO to KEWR on a 777, and give checklist", the
-        # model planned the route and then wrote an eight-item checklist
-        # from memory -- "file a flight plan with air traffic control",
-        # "obtain clearance for takeoff" -- none of it in the corpus and
-        # none of it cited. Asked again for an A320 it produced the
-        # IDENTICAL eight items, which is the tell: nothing derived them
-        # from anything.
+        # NO CHECKLIST REMINDER HERE ANY MORE. There was one, added
+        # after the model planned a route and then wrote eight checklist
+        # items from memory. It worked -- find_procedures is now called
+        # reliably -- and then it leaked, printed to the user as a
+        # footnote beneath a checklist, saying "this plan contains no
+        # checklist". Correct when plan_flight returned, stale by the
+        # time the model wrote its reply.
         #
-        # The system prompt already forbade this. It was ignored because
-        # by the time the plan came back, the checklist had become an
-        # afterthought. A note in the result arrives at that moment
-        # instead of thousands of tokens earlier.
-        result["checklist_note"] = (
-            "This plan contains no checklist. If the user asked what to "
-            "check, or for a briefing, call find_procedures -- do not write "
-            "one from memory."
-        )
-        result["ete_note"] = (
+        # It is gone rather than reworded because what it was patching is
+        # fixed twice over: the system prompt states the rule
+        # unconditionally, and report.py refuses to render an uncited
+        # item regardless of what the model does. An instruction that
+        # only might be obeyed is not worth the risk of it being read
+        # aloud.
+        result["_ete_note"] = (
             "Report the time as written in `ete_spoken`; do not reformat "
             "`ete`. ETE is airborne time from takeoff to landing and "
             "excludes taxi, so it reads lower than a published schedule."
@@ -910,23 +905,21 @@ def plan_flight(
                 f"{_spoken_duration(whole_hours, minutes)} against "
                 f"{endurance:.1f} h of "
                 f"endurance, and the route crosses open water where there is "
-                "nowhere to refuel. Say plainly that this is the wrong "
-                "aircraft for the trip, and suggest planning again with a "
-                "type that has the range."
+                "nowhere to refuel. This is the wrong aircraft for the trip; "
+                "one with the range is needed."
             )
         else:
             result["range_warning"] = (
                 f"Flight time of {_spoken_duration(whole_hours, minutes)} "
                 f"exceeds the "
                 f"{profile.name}'s {endurance:.1f} h endurance. About "
-                f"{stops} fuel stop{'s' if stops != 1 else ''} would be needed "
-                "-- tell the user this plainly."
+                f"{stops} fuel stop{'s' if stops != 1 else ''} would be needed."
             )
 
     if aircraft_defaulted:
         result["aircraft_note"] = (
             f"No aircraft was specified, so this was planned for a "
-            f"{profile.name}. Tell the user which aircraft was assumed."
+            f"{profile.name}."
         )
 
     return result

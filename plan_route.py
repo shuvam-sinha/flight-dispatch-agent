@@ -120,6 +120,20 @@ def parse_args(argv=None) -> argparse.Namespace:
         const="route_map.html",
         help="Write an interactive HTML map (default filename: route_map.html)",
     )
+    parser.add_argument(
+        "--report",
+        metavar="PATH",
+        nargs="?",
+        const="dispatch_report.html",
+        help="Write a full dispatch report as HTML and JSON "
+             "(default filename: dispatch_report.html)",
+    )
+    parser.add_argument(
+        "--checklist",
+        action="store_true",
+        help="Include a retrieved, cited preflight checklist in the report. "
+             "Needs Ollama and nomic-embed-text.",
+    )
     return parser.parse_args(argv)
 
 
@@ -475,7 +489,70 @@ def main(argv=None) -> int:
         )
         print(f"\nMap written to {written}")
 
+    if args.report:
+        _write_report(plan, args, airspace_index)
+
     return 0  # exit status 0 = success
+
+
+def _write_report(plan, args, airspace_index) -> None:
+    """Write the dispatch report, with a checklist if one was asked for.
+
+    THE CHECKLIST IS OPTIONAL AND ITS FAILURE IS NOT FATAL. Retrieval
+    needs Ollama and an embedding model running; a report without a
+    checklist is still a complete route, map and fuel plan, so a missing
+    embedding service costs the checklist rather than the report.
+
+    Nothing here writes a checklist itself. `--checklist` renders the
+    RETRIEVED procedures as items, each citing its own document -- the
+    CLI has no model to phrase them, and phrasing them itself would be
+    exactly the invention the whole design forbids.
+    """
+    from flight_dispatch.report import build_report
+
+    checklist_text = ""
+    procedures = []
+    figures = {}
+
+    if args.checklist:
+        from flight_dispatch.tools import find_procedures
+
+        result = find_procedures(
+            aircraft=args.aircraft,
+            phase="preflight",
+            origin=plan.origin.icao,
+            dest=plan.dest.icao,
+        )
+        if "error" in result:
+            print(f"\nChecklist unavailable: {result['error']}")
+        else:
+            procedures = result["procedures"]
+            figures = result.get("figures", {})
+            # First sentence of each procedure, cited to it. A summary is
+            # the model's job; this is a quotation.
+            checklist_text = "\n".join(
+                f"- {_first_sentence(item['text'])} [{item['id']}]"
+                for item in procedures
+            )
+
+    report = build_report(
+        plan,
+        checklist_text=checklist_text,
+        procedures=procedures,
+        figures=figures,
+    )
+    written = report.write(
+        args.report,
+        airspace=airspace_index.volumes if airspace_index else None,
+    )
+    print(f"\nReport written to {written['html']}")
+    print(f"            and {written['json']}")
+
+
+def _first_sentence(text: str) -> str:
+    """The opening sentence of a procedure, for a quoted checklist item."""
+    sentence = text.strip().split(". ")[0].replace("\n", " ")
+    return " ".join(sentence.split()).rstrip(".")
 
 
 # Only run main() when this file is executed directly, not when it is

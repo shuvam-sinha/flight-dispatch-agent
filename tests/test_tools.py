@@ -973,52 +973,92 @@ class TestArgumentCoercion(unittest.TestCase):
         self.assertEqual(result["altitude_ft"], 34000.0)
 
 
-class TestInstructionsAreNamedAsNotes(unittest.TestCase):
-    """A field that tells the model what to do must be named `*_note`.
+class TestFactsAndInstructionsAreSeparate(unittest.TestCase):
+    """A result field is either a fact for the user or an instruction to
+    the model, and never both.
 
-    THE LEAK THIS PREVENTS. `waypoints_omitted` carried both a fact and
-    an instruction, and the model printed the whole string to the user:
+    THE LEAK THIS ADDRESSES. `checklist_note` was printed to the user as
+    a footnote beneath a checklist, reading "this plan contains no
+    checklist" -- correct when plan_flight returned, stale by the time
+    the model replied. It was already named `*_note`, which had been the
+    convention for things the model would not quote. One sample, and it
+    was wrong: naming lowers the chance of a leak, it does not prevent
+    one.
 
-        **Waypoints Omitted:** 23 waypoints -- per-leg detail omitted to
-        stay within context. Report the route string and the totals;
-        offer the map for detail.
-
-    Every other instruction-bearing field was already `*_note` and none
-    of them leaked. A reader treats a field named like data as data, and
-    so does the model. Renaming it was the whole fix.
+    So instructions are few, prefixed with an underscore, and the system
+    prompt says never to quote them. Everything else in a result is a
+    fact that the user is welcome to see.
     """
 
-    IMPERATIVES = (
-        "report the", "say so", "say it", "tell the user", "call ",
-        "do not ", "never ", "offer the", "write the",
+    # Phrases that are unambiguously directed AT THE READER. A looser
+    # list flagged "navaids do not cover open water", which is a
+    # description rather than an order -- the distinction the whole rule
+    # turns on.
+    INSTRUCTION_WORDS = (
+        "report the route",
+        "report the time",
+        "do not reformat",
+        "do not write",
+        "do not quote",
+        "never quote",
+        "tell the user",
+        "offer the map",
+        "say plainly",
     )
 
-    def results(self):
-        yield "plan_flight", dispatch(
-            "plan_flight",
-            {"origin": "KJFK", "dest": "KLAX", "aircraft": "b738", "use_wind": False},
-        )
-        yield "check_airspace", dispatch(
-            "check_airspace", {"origin": "KLAX", "dest": "KSLC"}
-        )
-        yield "find_airport", dispatch("find_airport", {"query": "Chicago"})
+    def plan(self, **kwargs):
+        arguments = {
+            "origin": "KJFK",
+            "dest": "EGLL",
+            "aircraft": "c172",
+            "use_wind": False,
+        }
+        arguments.update(kwargs)
+        return dispatch("plan_flight", arguments)
 
-    def test_instruction_bearing_fields_are_notes(self):
-        for tool_name, result in self.results():
-            for field, value in result.items():
-                if not isinstance(value, str):
-                    continue
-                if any(word in value.lower() for word in self.IMPERATIVES):
-                    with self.subTest(f"{tool_name}.{field}"):
-                        self.assertTrue(
-                            field.endswith("note") or field == "hint",
-                            f"{field} instructs the model but is not named as a note",
-                        )
+    def test_instruction_fields_are_underscored(self):
+        for field, value in self.plan().items():
+            if isinstance(value, str) and any(
+                word in value.lower() for word in self.INSTRUCTION_WORDS
+            ):
+                with self.subTest(field):
+                    self.assertTrue(
+                        field.startswith("_"),
+                        f"{field} instructs the model but is not underscored",
+                    )
 
-    def test_the_renamed_field_still_reports_the_count(self):
-        result = dispatch(
-            "plan_flight",
-            {"origin": "KJFK", "dest": "KLAX", "aircraft": "b738", "use_wind": False},
-        )
-        self.assertIn("waypoints_note", result)
-        self.assertNotIn("waypoints_omitted", result)
+    def test_user_facing_fields_carry_no_instruction(self):
+        # A safety warning the user must see cannot also be telling the
+        # model what to do, or it becomes unquotable.
+        result = self.plan()
+        for field in ("wind", "restricted_airspace", "range_warning", "aircraft_note"):
+            if field in result:
+                with self.subTest(field):
+                    self.assertFalse(
+                        any(
+                            word in result[field].lower()
+                            for word in self.INSTRUCTION_WORDS
+                        ),
+                        f"{field} is shown to the user but contains an instruction",
+                    )
+
+    def test_the_range_warning_is_still_a_warning(self):
+        # Stripping the instruction must not strip the substance.
+        warning = self.plan()["range_warning"]
+        self.assertIn("cannot fly this route", warning)
+        self.assertIn("nowhere to refuel", warning)
+
+    def test_the_defaulted_aircraft_is_still_reported(self):
+        note = self.plan(aircraft=None).get("aircraft_note", "")
+        self.assertIn("No aircraft was specified", note)
+
+    def test_the_stale_checklist_note_is_gone(self):
+        # It leaked, and what it patched is fixed twice over: the system
+        # prompt states the rule, and the report refuses uncited items.
+        self.assertNotIn("checklist_note", self.plan())
+
+    def test_the_prompt_explains_the_underscore_convention(self):
+        from flight_dispatch.agent import DEFAULT_SYSTEM_PROMPT
+
+        self.assertIn("underscore", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("never quote", DEFAULT_SYSTEM_PROMPT.lower())
