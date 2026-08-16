@@ -72,15 +72,20 @@ in your reply -- a call written as text does not run.
 - A field whose name begins with an underscore is an instruction to you. \
 Follow it; never quote it, repeat it, or show it to the user.
 
+ANSWER THE WHOLE REQUEST. If the user asks to plan a flight, call \
+plan_flight. If they ask for a checklist, call find_procedures. If they \
+ask for both -- "plan this and give me a checklist" -- you need both \
+calls: a checklist is not a plan, and a plan is not a checklist. Failed \
+tool calls along the way do not excuse dropping half the request; \
+recover and finish it.
+
 CHECKLISTS. Never write a checklist, briefing or list of things to check \
-without calling find_procedures first. This holds even when the checklist \
-is only part of the request, and even when you have just planned a \
-flight -- planning a route does not tell you what to check. Every item \
-must carry the id of the procedure it came from, in brackets, like \
-[fuel-reserves]. An item you cannot cite is an item you must not write. \
-If a pilot would want something the retrieved material does not cover, \
-say it is not covered rather than supplying it from memory: a short \
-cited checklist is worth more than a long invented one.
+without calling find_procedures first. Every item must carry the id of \
+the procedure it came from, in brackets, like [fuel-reserves]. An item \
+you cannot cite is an item you must not write. If a pilot would want \
+something the retrieved material does not cover, say it is not covered \
+rather than supplying it from memory: a short cited checklist is worth \
+more than a long invented one.
 
 If the user asks about a specific situation -- a bird strike, a gear \
 failure -- and the retrieved procedures do not address it, say so in the \
@@ -214,6 +219,51 @@ class DispatcherAgent:
         self.turns: List[Turn] = []
         self.backend.start(system_prompt, self.tools)
 
+    @staticmethod
+    def _signature(call: "ToolCall") -> str:
+        """A call's identity: its name and its arguments, order-independent."""
+        import json
+
+        return f"{call.name}:{json.dumps(call.arguments, sort_keys=True, default=str)}"
+
+    def _escalate_if_repeated(
+        self, turn: "Turn", call: "ToolCall", content: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Replace a repeated identical failure with a firmer message.
+
+        The same error text, returned twice, reads to a model as the
+        same situation -- so it tries the same thing again. Changing the
+        message changes the situation.
+
+        Only exact repeats count. A model narrowing in on the right
+        arguments is making progress and should be left alone; it is
+        the identical call that indicates it is stuck.
+        """
+        signature = self._signature(call)
+
+        failed_before = any(
+            self._signature(earlier) == signature
+            for earlier, result in zip(turn.tool_calls[:-1], turn.tool_results)
+            if result.is_error
+        )
+        if not failed_before:
+            return content
+
+        return {
+            "error": (
+                f"You have already called {call.name} with exactly these "
+                f"arguments and it failed the same way. Do not send it a "
+                f"third time. Change the arguments, use a different tool, "
+                f"or continue with what you already have."
+            ),
+            "previous_error": content["error"],
+            **{
+                key: value
+                for key, value in content.items()
+                if key not in ("error",)
+            },
+        }
+
     def ask(self, message: str) -> Turn:
         """Send a user message and run the loop until the model is done.
 
@@ -255,10 +305,23 @@ class DispatcherAgent:
 
                 # dispatch() never raises -- failures come back as dicts
                 # the model can read and recover from.
+                content = dispatch(call.name, call.arguments)
+
+                # A model can read an error and try the same thing again.
+                # Observed: list_aircraft(category='wide-body') failed,
+                # the error listed the five valid categories, and the
+                # very next call was list_aircraft(category='wide-body').
+                # The system prompt already said not to. Repeating the
+                # same message would have invited a third attempt, and
+                # by the time it recovered it had forgotten half the
+                # request.
+                #
+                # So the second identical failure gets a different
+                # message -- one that cannot be read past.
+                if "error" in content:
+                    content = self._escalate_if_repeated(turn, call, content)
                 result = ToolResult(
-                    call_id=call.id,
-                    name=call.name,
-                    content=dispatch(call.name, call.arguments),
+                    call_id=call.id, name=call.name, content=content
                 )
                 results.append(result)
                 turn.tool_results.append(result)

@@ -8,7 +8,7 @@ from flight_dispatch.agent import (
     ToolCall,
     ToolResult,
 )
-from flight_dispatch.tools import ToolSpec
+from flight_dispatch.tools import TOOLS_BY_NAME, ToolSpec
 
 
 class ScriptedBackend:
@@ -297,3 +297,140 @@ class TestToolSubset(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRepeatedFailureEscalation(unittest.TestCase):
+    """THE LOOP THIS BREAKS.
+
+    Observed in a real session: list_aircraft(category='wide-body')
+    failed, the error listed the five valid categories, and the very next
+    call was list_aircraft(category='wide-body'). The system prompt
+    already said not to repeat a failing call.
+
+    The same error text, returned twice, reads to a model as the same
+    situation -- so it tries the same thing again. Changing the message
+    changes the situation. By the time that session recovered it had
+    forgotten half the request and never planned the flight.
+    """
+
+    def agent(self, replies, tools=("list_aircraft",)):
+        backend = ScriptedBackend(replies)
+        return backend, DispatcherAgent(
+            backend, tools=[TOOLS_BY_NAME[name] for name in tools]
+        )
+
+    def failing(self, call_id):
+        return ModelResponse(
+            tool_calls=[
+                ToolCall(call_id, "list_aircraft", {"category": "wide-body"})
+            ]
+        )
+
+    def test_the_first_failure_is_reported_normally(self):
+        _, agent = self.agent([self.failing("1"), ModelResponse(text="done")])
+        turn = agent.ask("find a widebody")
+        self.assertIn("No aircraft in category", turn.tool_results[0].content["error"])
+
+    def test_an_identical_second_failure_is_escalated(self):
+        _, agent = self.agent(
+            [self.failing("1"), self.failing("2"), ModelResponse(text="done")]
+        )
+        turn = agent.ask("find a widebody")
+        second = turn.tool_results[1].content["error"]
+        self.assertIn("already called", second)
+        self.assertIn("third time", second)
+
+    def test_the_original_error_is_preserved(self):
+        # The model still needs to know WHAT failed, not only that it
+        # repeated itself.
+        _, agent = self.agent(
+            [self.failing("1"), self.failing("2"), ModelResponse(text="done")]
+        )
+        turn = agent.ask("find a widebody")
+        self.assertIn(
+            "No aircraft in category", turn.tool_results[1].content["previous_error"]
+        )
+
+    def test_helpful_fields_survive_the_escalation(self):
+        # valid_categories is the thing that would let it recover.
+        _, agent = self.agent(
+            [self.failing("1"), self.failing("2"), ModelResponse(text="done")]
+        )
+        turn = agent.ask("find a widebody")
+        self.assertIn("valid_categories", turn.tool_results[1].content)
+
+    def test_different_arguments_are_not_escalated(self):
+        # A model narrowing in on the right arguments is making progress
+        # and should be left alone.
+        backend = ScriptedBackend(
+            [
+                ModelResponse(
+                    tool_calls=[ToolCall("1", "list_aircraft", {"category": "wide"})]
+                ),
+                ModelResponse(
+                    tool_calls=[ToolCall("2", "list_aircraft", {"category": "big"})]
+                ),
+                ModelResponse(text="done"),
+            ]
+        )
+        agent = DispatcherAgent(backend, tools=[TOOLS_BY_NAME["list_aircraft"]])
+        turn = agent.ask("find a widebody")
+        self.assertNotIn("already called", turn.tool_results[1].content["error"])
+
+    def test_argument_order_does_not_hide_a_repeat(self):
+        backend = ScriptedBackend(
+            [
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall("1", "plan_flight", {"origin": "ZZZZ", "dest": "YYYY"})
+                    ]
+                ),
+                ModelResponse(
+                    tool_calls=[
+                        ToolCall("2", "plan_flight", {"dest": "YYYY", "origin": "ZZZZ"})
+                    ]
+                ),
+                ModelResponse(text="done"),
+            ]
+        )
+        agent = DispatcherAgent(backend, tools=[TOOLS_BY_NAME["plan_flight"]])
+        turn = agent.ask("plan it")
+        self.assertIn("already called", turn.tool_results[1].content["error"])
+
+    def test_a_successful_call_is_never_escalated(self):
+        backend = ScriptedBackend(
+            [
+                ModelResponse(
+                    tool_calls=[ToolCall("1", "list_aircraft", {"category": "ga"})]
+                ),
+                ModelResponse(
+                    tool_calls=[ToolCall("2", "list_aircraft", {"category": "ga"})]
+                ),
+                ModelResponse(text="done"),
+            ]
+        )
+        agent = DispatcherAgent(backend, tools=[TOOLS_BY_NAME["list_aircraft"]])
+        turn = agent.ask("list them")
+        self.assertNotIn("error", turn.tool_results[1].content)
+
+
+class TestWholeRequestRule(unittest.TestCase):
+    """A checklist is not a plan, and a plan is not a checklist.
+
+    The checklist rule was written to stop the model writing one from
+    memory. It worked, and then it overcorrected: asked to "plan a flight
+    from KSFO to KEWR on a 777 and give me a checklist", the model called
+    find_procedures and never called plan_flight at all.
+    """
+
+    def test_the_prompt_requires_both_calls(self):
+        from flight_dispatch.agent import DEFAULT_SYSTEM_PROMPT
+
+        prompt = DEFAULT_SYSTEM_PROMPT.lower()
+        self.assertIn("a checklist is not a plan", prompt)
+        self.assertIn("you need both", prompt)
+
+    def test_the_prompt_says_failures_do_not_excuse_dropping_half(self):
+        from flight_dispatch.agent import DEFAULT_SYSTEM_PROMPT
+
+        self.assertIn("do not excuse dropping half", DEFAULT_SYSTEM_PROMPT)

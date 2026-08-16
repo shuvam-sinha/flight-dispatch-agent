@@ -1,0 +1,177 @@
+{
+  "generated_at": "2026-08-16 17:54 UTC",
+  "origin": {
+    "icao": "KDEN",
+    "name": "Denver International Airport",
+    "elevation_ft": 5431.0
+  },
+  "destination": {
+    "icao": "KMIA",
+    "name": "Miami International Airport",
+    "elevation_ft": 8.0
+  },
+  "route": "KDEN ITR TQK PTT BVO DAK TYV SBQ EOG HYE FPY PCM CHN KMIA",
+  "waypoints": [
+    {
+      "ident": "KDEN",
+      "latitude": 39.86,
+      "longitude": -104.6738
+    },
+    {
+      "ident": "ITR",
+      "latitude": 39.2462,
+      "longitude": -102.284
+    },
+    {
+      "ident": "TQK",
+      "latitude": 38.4801,
+      "longitude": -100.888
+    },
+    {
+      "ident": "PTT",
+      "latitude": 37.7239,
+      "longitude": -98.747
+    },
+    {
+      "ident": "BVO",
+      "latitude": 36.8342,
+      "longitude": -96.0183
+    },
+    {
+      "ident": "DAK",
+      "latitude": 36.0429,
+      "longitude": -94.1976
+    },
+    {
+      "ident": "TYV",
+      "latitude": 34.9525,
+      "longitude": -92.0195
+    },
+    {
+      "ident": "SBQ",
+      "latitude": 33.8912,
+      "longitude": -89.8745
+    },
+    {
+      "ident": "EOG",
+      "latitude": 32.6024,
+      "longitude": -87.6631
+    },
+    {
+      "ident": "HYE",
+      "latitude": 31.3668,
+      "longitude": -85.65
+    },
+    {
+      "ident": "FPY",
+      "latitude": 29.9961,
+      "longitude": -83.5863
+    },
+    {
+      "ident": "PCM",
+      "latitude": 28.0025,
+      "longitude": -82.1567
+    },
+    {
+      "ident": "CHN",
+      "latitude": 27.51,
+      "longitude": -81.8833
+    },
+    {
+      "ident": "KMIA",
+      "latitude": 25.796,
+      "longitude": -80.2898
+    }
+  ],
+  "direct_distance_nm": 1484.1,
+  "route_distance_nm": 1501.5,
+  "efficiency_percent": 101.2,
+  "aircraft": {
+    "key": "b738",
+    "name": "Boeing 737-800",
+    "cruise_tas_kt": 453.0,
+    "cruise_altitude_ft": 35000.0
+  },
+  "ete": "3h28m",
+  "ete_hours": 3.46,
+  "fuel_required_gal": 3453.2,
+  "within_aircraft_range": true,
+  "profile": {
+    "climb_minutes": 15,
+    "climb_distance_nm": 84,
+    "cruise_distance_nm": 1318,
+    "cruise_altitude_ft": 35000,
+    "descent_minutes": 18,
+    "descent_distance_nm": 100,
+    "reached_planned_altitude": true
+  },
+  "restricted_airspace_avoided": 138,
+  "checklist": [
+    {
+      "text": "Above 10,000 ft the physiological environment becomes the limiting factor.",
+      "citations": [
+        "high-altitude-cruise"
+      ]
+    },
+    {
+      "text": "Density altitude is pressure altitude corrected for temperature, and it is what the aircraft actually feels.",
+      "citations": [
+        "density-altitude"
+      ]
+    },
+    {
+      "text": "The order is fixed: fly the aircraft, pick a field, then troubleshoot. Pilots have flown serviceable aircraft into the ground while working a checklist. Establish best glide speed immediately and trim for it.",
+      "citations": [
+        "engine-failure"
+      ]
+    },
+    {
+      "text": "An emergency descent is warranted by pressurisation failure, an uncontrolled fire, or any condition where remaining at altitude is more dangerous than descending rapidly. With a pressurisation failure the order is oxygen first.",
+      "citations": [
+        "emergency-descent"
+      ]
+    }
+  ],
+  "sources": [
+    {
+      "id": "high-altitude-cruise",
+      "title": "High altitude cruise",
+      "category": "operations",
+      "text": "Above 10,000 ft the physiological environment becomes the limiting\nfactor. Time of useful consciousness falls from around 20 minutes at\n18,000 ft to well under a minute above 35,000 ft.\n\nHypoxia is dangerous because its onset is comfortable: euphoria, poor\njudgement and slowed reaction arrive before any sense of breathlessness.\nThe victim often feels fine.\n\nKnow the aircraft's oxygen or pressurisation system and check it before\ndeparture rather than when needed. In a pressurisation failure, the\nsequence is oxygen mask on first, then an emergency descent, then\ncommunicate.\n\nCruise altitude selection trades against wind. A higher level offers\nlower fuel flow and better true airspeed, but the jet stream can impose a\nheadwind that outweighs both. The winds-aloft forecast decides which\nlevel is fastest."
+    },
+    {
+      "id": "density-altitude",
+      "title": "Density altitude",
+      "category": "performance",
+      "text": "Density altitude is pressure altitude corrected for temperature, and it\nis what the aircraft actually feels. High elevation, high temperature and\nhigh humidity each reduce air density, and their effects combine.\n\nConsequences are simultaneous and all unfavourable: the engine produces\nless power, the propeller is less efficient, and the wing needs a higher\ntrue airspeed for the same lift. Takeoff roll lengthens, climb rate falls\nand the service ceiling drops.\n\nAn airfield at 5,000 ft on a hot afternoon can behave like 8,000 ft or\nmore. Performance charts assume a standard atmosphere, so the correction\nis not optional.\n\nPlan departures for early morning where possible, reduce weight rather\nthan hope, and compute the actual takeoff distance for the actual\nconditions against the actual runway length."
+    },
+    {
+      "id": "engine-failure",
+      "title": "Engine failure in flight",
+      "category": "emergency",
+      "text": "The order is fixed: fly the aircraft, pick a field, then troubleshoot.\nPilots have flown serviceable aircraft into the ground while working a\nchecklist.\n\nEstablish best glide speed immediately and trim for it. Best glide is a\nspecific number for the aircraft and weight, and both faster and slower\nreduce the distance available.\n\nChoose a landing site while altitude still offers a choice, favouring\ninto-wind, long, smooth and unobstructed over merely close. Commit early;\nchanging target late costs more than the imperfection of the first\nchoice.\n\nThen run the restart flow: fuel selector to a tank with fuel, mixture\nrich, carburettor heat on, ignition on both, boost pump as fitted.\n\nDeclare an emergency. Squawk 7700. Secure fuel and ignition before touch\ndown, keep the shoulder harness tight, and fly the aircraft all the way\ninto the crash."
+    },
+    {
+      "id": "emergency-descent",
+      "title": "Emergency descent",
+      "category": "emergency",
+      "text": "An emergency descent is warranted by pressurisation failure, an\nuncontrolled fire, or any condition where remaining at altitude is more\ndangerous than descending rapidly.\n\nWith a pressurisation failure the order is oxygen first. Consciousness is\nthe prerequisite for everything else, and time of useful consciousness at\nhigh altitude is measured in seconds.\n\nThen descend at the maximum rate the airframe allows: power to idle,\nspeed brakes as fitted, and a bank to increase the rate while keeping the\nspeed within limits. In turbulence or with suspected structural damage,\nuse a lower speed -- a rapid descent that overstresses the airframe has\nsolved nothing.\n\nLevel off at a safe altitude. 10,000 ft is standard where terrain allows,\nand the minimum safe altitude for the sector where it does not.\n\nDeclare the emergency and squawk 7700."
+    }
+  ],
+  "figures": {
+    "usable_fuel_gal": 6875,
+    "reserve_gal": 622,
+    "reserve_minutes": 45,
+    "endurance_hours": 6.7,
+    "still_air_range_nm": 3026,
+    "useful_load_lb": 82900,
+    "typical_payload_lb": 41580,
+    "max_fuel_with_typical_payload_gal": 6167,
+    "cruise_altitude_ft": 35000,
+    "service_ceiling_ft": 41000,
+    "direct_distance_nm": 1484.1,
+    "origin_elevation_ft": 5431,
+    "destination_elevation_ft": 8
+  },
+  "rejected_uncited_items": []
+}
