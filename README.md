@@ -356,17 +356,6 @@ far less of the graph.
 KPWK→KMSP    Dijkstra expanded 216 nodes    A* expanded 3    identical route
 ```
 
-Admissibility is the whole argument. A heuristic that overestimates makes A\*
-fast and wrong; one that never overestimates makes it fast and provably optimal.
-When the cost became time rather than distance, the heuristic had to be
-rewritten to stay admissible — nautical miles are not a lower bound on hours —
-which is why `a_star` takes a `distance_to_cost` converter rather than assuming
-the units.
-
-Written by hand rather than imported from `networkx`, for the same reason the
-agent loop is: the algorithm is the thing worth demonstrating. It is about 90
-lines over `heapq`, and it was verified against exhaustive brute-force search on
-400 random graphs and against Dijkstra on real routes.
 
 ### Why the mesh radius is 150 nm
 
@@ -392,11 +381,6 @@ was the better fit — the same GFS/ECMWF runs that FD is derived from, served a
 any coordinate. `WindSource` exists so that decision can be revisited without
 touching the router.
 
-### Why navaids, not airports, as intermediate waypoints
-
-Real en-route waypoints are navaids and named intersections. Airports appear in
-a flight plan as origin, destination and alternate — you don't route *over* one
-you aren't landing at. So the mesh uses navaids, with airports only at the ends.
 
 ### Why an on-device model
 
@@ -448,30 +432,6 @@ questions in one evening:
 | 30-waypoint oceanic route | `27N023W` → `27NN023W` | copied intact |
 | Conversation depth | dead at turn 3 | 14% used after 7 |
 
-So the tool-selection failures were **model capacity**, not description quality.
-One number still slipped in transcription (`18871.7` → `18771.7`), which says
-the "supply the phrasing, never make the model derive it" work was correct
-engineering rather than a workaround for a small model.
-
-The new backend also exposed three bugs the first one had hidden:
-
-- **Stringified arguments.** Ollama sends `payload_lb='300'`, which reached the
-  weight arithmetic as text and raised a `TypeError`. Worse, `avoid_airspace='true'`
-  never raised — a non-empty string is truthy, so `'false'` would have been too,
-  quietly turning airspace avoidance *on* when the model asked for it off.
-  Coercion now happens once in `dispatch()`, against each parameter's declared
-  type, so every tool and every future backend inherits it.
-- **A fix in the wrong layer.** Withholding `altitude_ft` was implemented inside
-  `backend_apple._is_exposed`, which is Apple's rule — needed because its schema
-  cannot express optionality. JSON Schema can, so Ollama rebuilt the parameter
-  and volunteered 30,000 ft for a Cirrus that tops out at 17,500. A decision
-  about the *tool* now lives in the tool.
-- **Tool calls written as text.** llama3.1 sometimes writes
-  `{"name": "plan_flight", "parameters": {...}}` into its reply instead of
-  emitting a call — both observed cases followed a tool result. The loop saw
-  prose, concluded the model was finished, and handed raw JSON to the user.
-  Recognised and executed now, guarded so that only a name matching an exposed
-  tool is run.
 
 ### Why the tool descriptions are prose, not code
 
@@ -523,11 +483,6 @@ schedules live in manufacturer performance manuals, which are not public data,
 and inventing 47 sets of them would be dressing a guess up as a specification.
 Speeds are fractions of each aircraft's own cruise TAS, so a Cessna's climb
 speed stays sensible for a Cessna.
-
-Fixing this also exposed a smaller bug: the CLI compared average ground speed
-against cruise TAS to report net head- or tailwind. Once climb and descent were
-in the average, every flight reported a headwind. The comparison now uses the
-cruise segment, which is the part the wind acted on.
 
 Remaining gap to a published schedule is taxi and padding. ETE is airborne time
 and is labelled as such.
@@ -599,20 +554,6 @@ different columns), `Sao Paulo` matched nothing (accents), and `JFK` matched
 nothing (IATA codes aren't substrings of names). Across 45 major world cities
 the ranker now returns the expected airport 44 times.
 
-**The airspace result was narrated backwards.** The router avoided all 95
-restricted areas near a route, and the reply said *"Route includes prohibited
-and restricted airspace."* Every number was correct; the safety claim came out
-inverted. The cause was two fields the model had to assemble itself —
-`airspace_avoidance_applied: true` and `restricted_volumes_considered: 95` —
-where "considered" reads equally well as *taken into account* and *included in*.
-It now returns one sentence that cannot be read the other way.
-
-This generalised the founding rule. "The model never does computation" was not
-enough: `95` is a number reported faithfully, and *through* versus *around* is
-an interpretation built from it. **The model never derives anything.** No test
-caught this, because every test checked the router, and the router was never
-wrong.
-
 **A schema constraint cascaded three times.** Apple's format cannot express an
 optional parameter, so every parameter offered gets filled — the model invented
 `payload_lb: 1600` for a Cessna 172, exceeding its 870 lb useful load, and both
@@ -624,29 +565,6 @@ for the wind at 35,000 ft it answered at its 8,000 ft default and labelled the
 answer 35,000. The rule that came out of it is narrower than any of the three
 attempts: **expose a parameter where it is the question, withhold it where the
 aircraft already knows the answer.**
-
-**A single flight plan could exhaust the weather API's quota.** Live winds
-failed on every long route for three sessions. Open-Meteo meters *work*, not
-requests — roughly locations × variables × days — and at a fixed 0.5° grid a
-transcontinental plan wanted ~1,936 units against a 600-per-minute allowance. No
-retry schedule could have helped. The cell count is now capped and the grid
-resolution follows, so short routes keep fine resolution and long ones coarsen.
-
-**The model mistyped numbers it had to reformat.** `27N023W` became `27NN023W`
-in a 30-waypoint oceanic route; `1h01m` became "1 hour 4 minutes". In the same
-reply, distance, fuel, altitude and airspace count were all exact, and the
-`wind` and `restricted_airspace` sentences were copied verbatim. The compact
-token was the only thing the model had to *rewrite* rather than repeat. So the
-tool supplies the phrasing — `ete_spoken: "1 hour 1 minute"` — the same move as
-the compass point, which exists because 239° came back as "from the northeast".
-
-**The map drew the wrong line.** The dashed reference course was drawn from two
-points, and Leaflet joins two points with a line that is straight *on screen* —
-a rhumb line, not a great circle. San Francisco to Dubai showed a "direct
-course" labelled 7,030 nm running across Africa, beside a route labelled 7,290
-nm that appeared to detour thousands of miles over the Arctic for nothing. The
-route was right; the line it was compared against was a different path. The
-course is now sampled at 64 points along the actual great circle.
 
 ## Scope
 
