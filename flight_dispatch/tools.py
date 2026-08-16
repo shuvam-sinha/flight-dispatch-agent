@@ -725,7 +725,18 @@ def plan_flight(
     if len(plan.waypoints) <= MAX_DETAILED_WAYPOINTS:
         result["waypoints"] = _describe_waypoints(plan)
     else:
-        result["waypoints_omitted"] = (
+        # NAMED `_note` BECAUSE IT CARRIES AN INSTRUCTION. Called
+        # `waypoints_omitted`, the model read it as data and printed the
+        # whole string to the user, guidance included:
+        #
+        #     **Waypoints Omitted:** 23 waypoints -- per-leg detail
+        #     omitted to stay within context. Report the route string and
+        #     the totals; offer the map for detail.
+        #
+        # The other instruction-bearing fields are all `*_note` and none
+        # of them leaked. A reader treats a field named like data as data
+        # and a field named like a note as a note, and so does the model.
+        result["waypoints_note"] = (
             f"{len(plan.waypoints)} waypoints -- per-leg detail omitted to stay "
             "within context. Report the route string and the totals; offer the "
             "map for detail."

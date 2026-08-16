@@ -971,3 +971,54 @@ class TestArgumentCoercion(unittest.TestCase):
                 {"latitude": 39.86, "longitude": -104.67, "altitude_ft": "34000"},
             )
         self.assertEqual(result["altitude_ft"], 34000.0)
+
+
+class TestInstructionsAreNamedAsNotes(unittest.TestCase):
+    """A field that tells the model what to do must be named `*_note`.
+
+    THE LEAK THIS PREVENTS. `waypoints_omitted` carried both a fact and
+    an instruction, and the model printed the whole string to the user:
+
+        **Waypoints Omitted:** 23 waypoints -- per-leg detail omitted to
+        stay within context. Report the route string and the totals;
+        offer the map for detail.
+
+    Every other instruction-bearing field was already `*_note` and none
+    of them leaked. A reader treats a field named like data as data, and
+    so does the model. Renaming it was the whole fix.
+    """
+
+    IMPERATIVES = (
+        "report the", "say so", "say it", "tell the user", "call ",
+        "do not ", "never ", "offer the", "write the",
+    )
+
+    def results(self):
+        yield "plan_flight", dispatch(
+            "plan_flight",
+            {"origin": "KJFK", "dest": "KLAX", "aircraft": "b738", "use_wind": False},
+        )
+        yield "check_airspace", dispatch(
+            "check_airspace", {"origin": "KLAX", "dest": "KSLC"}
+        )
+        yield "find_airport", dispatch("find_airport", {"query": "Chicago"})
+
+    def test_instruction_bearing_fields_are_notes(self):
+        for tool_name, result in self.results():
+            for field, value in result.items():
+                if not isinstance(value, str):
+                    continue
+                if any(word in value.lower() for word in self.IMPERATIVES):
+                    with self.subTest(f"{tool_name}.{field}"):
+                        self.assertTrue(
+                            field.endswith("note") or field == "hint",
+                            f"{field} instructs the model but is not named as a note",
+                        )
+
+    def test_the_renamed_field_still_reports_the_count(self):
+        result = dispatch(
+            "plan_flight",
+            {"origin": "KJFK", "dest": "KLAX", "aircraft": "b738", "use_wind": False},
+        )
+        self.assertIn("waypoints_note", result)
+        self.assertNotIn("waypoints_omitted", result)
