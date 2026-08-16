@@ -430,3 +430,116 @@ class TestConditionsFromFlightFacts(unittest.TestCase):
         # pilot has to filter, and filtering is what a checklist avoids.
         for args in (("c172",), ("b789", "KJFK", "EGLL"), ("b738", "KDEN", "KMCI")):
             self.assertNotIn("night", self.conditions(*args))
+
+
+class TestCitationVerification(unittest.TestCase):
+    """THE FAILURE THIS CATCHES.
+
+    Asked to plan a flight from KSFO to KEWR on a 777 AND give a
+    checklist, the model planned the route and never called
+    find_procedures. It then wrote eight items from memory -- "file a
+    flight plan with air traffic control", "obtain clearance for takeoff"
+    -- none of it in the corpus and none of it cited. Asked again for an
+    A320 it produced the IDENTICAL eight items, which is the tell:
+    nothing derived them from anything.
+
+    It had been instructed not to, in the system prompt, twice. An
+    instruction is a request; this is a test.
+    """
+
+    def index(self):
+        return ProcedureIndex(
+            [
+                Chunk(id="fuel-reserves", title="f", category="planning", text="f"),
+                Chunk(id="preflight-inspection", title="p", category="preflight", text="p"),
+            ],
+            [[1.0], [1.0]],
+        )
+
+    def check(self, text):
+        from flight_dispatch.retrieval import verify_citations
+
+        return verify_citations(text, self.index())
+
+    def test_a_grounded_checklist_is_clean(self):
+        result = self.check(
+            "1. Drain every fuel sump [preflight-inspection].\n"
+            "2. Carry 45 minutes of reserve [fuel-reserves]."
+        )
+        self.assertTrue(result.is_clean)
+        self.assertEqual(len(result.supported), 2)
+
+    def test_the_777_answer_is_caught(self):
+        result = self.check(
+            "1. Perform a pre-flight inspection of the aircraft.\n"
+            "2. File a flight plan with air traffic control.\n"
+            "3. Obtain clearance for takeoff and departure."
+        )
+        self.assertFalse(result.is_clean)
+        self.assertEqual(len(result.unsupported), 3)
+
+    def test_a_citation_to_nothing_is_caught(self):
+        # Worse than no citation: it looks like provenance and is not.
+        result = self.check("1. Check the widget [not-a-procedure].")
+        self.assertEqual(result.unknown, ["not-a-procedure"])
+        self.assertFalse(result.is_clean)
+
+    def test_prose_around_the_list_needs_no_citation(self):
+        # A preamble or a caveat is not an assertion about procedure.
+        result = self.check(
+            "Based on the retrieved procedures, here is the checklist:\n"
+            "1. Drain every fuel sump [preflight-inspection].\n"
+            "Note: NOTAMs are not covered by these procedures."
+        )
+        self.assertTrue(result.is_clean)
+
+    def test_bullets_count_as_items(self):
+        result = self.check("- Check the oil.\n* Check the fuel.")
+        self.assertEqual(len(result.unsupported), 2)
+
+    def test_mixed_grounding_is_not_clean(self):
+        # The dangerous case: mostly cited, with one invented item
+        # hidden among them.
+        result = self.check(
+            "1. Drain every fuel sump [preflight-inspection].\n"
+            "2. Set the transponder to 1200 before departure.\n"
+            "3. Carry 45 minutes of reserve [fuel-reserves]."
+        )
+        self.assertFalse(result.is_clean)
+        self.assertEqual(len(result.unsupported), 1)
+        self.assertEqual(len(result.supported), 2)
+
+    def test_several_citations_on_one_line(self):
+        result = self.check(
+            "1. Fuel and weight both matter [fuel-reserves] [preflight-inspection]."
+        )
+        self.assertEqual(len(result.supported), 2)
+
+    def test_an_empty_answer_is_vacuously_clean(self):
+        self.assertTrue(self.check("").is_clean)
+
+
+class TestChecklistReminder(unittest.TestCase):
+    """The reminder that arrives where the failure happened.
+
+    The system prompt already forbade an uncited checklist and was
+    ignored -- by the time the plan came back, the checklist had become
+    an afterthought. A note in the result arrives at that moment instead
+    of thousands of tokens earlier.
+    """
+
+    def plan(self):
+        from flight_dispatch.tools import dispatch
+
+        return dispatch(
+            "plan_flight",
+            {"origin": "KPWK", "dest": "KMSP", "aircraft": "sr22", "use_wind": False},
+        )
+
+    def test_a_plan_says_it_contains_no_checklist(self):
+        note = self.plan()["checklist_note"]
+        self.assertIn("find_procedures", note)
+        self.assertIn("no checklist", note)
+
+    def test_the_note_forbids_writing_one_from_memory(self):
+        self.assertIn("from memory", self.plan()["checklist_note"])

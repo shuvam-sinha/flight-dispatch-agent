@@ -317,6 +317,80 @@ class ProcedureIndex:
         return None
 
 
+CITATION_PATTERN = re.compile(r"\[([a-z0-9][a-z0-9-]*)\]")
+
+
+@dataclass(frozen=True)
+class CitationCheck:
+    """The result of auditing a generated answer's citations.
+
+    Attributes:
+        cited: Every id the text claims to cite.
+        unknown: Cited ids that match no document. A citation to a
+            document that does not exist is worse than no citation --
+            it looks like provenance and is not.
+        unsupported: Lines that read like checklist items but carry no
+            citation at all. These are where invented material appears.
+        supported: Cited ids that do resolve.
+    """
+
+    cited: List[str]
+    unknown: List[str]
+    unsupported: List[str]
+    supported: List[str]
+
+    @property
+    def is_clean(self) -> bool:
+        return not self.unknown and not self.unsupported
+
+
+def verify_citations(text: str, index: "ProcedureIndex") -> CitationCheck:
+    """Audit a generated checklist against the corpus it should have used.
+
+    WHY A MECHANICAL CHECK AND NOT JUST AN INSTRUCTION. Asked to plan a
+    flight AND give a checklist in one request, the model planned the
+    route and then wrote eight items from memory -- "file a flight plan
+    with air traffic control", "obtain clearance for takeoff" -- none of
+    it in the corpus, none of it cited. It had been instructed not to,
+    in the system prompt, twice. Asked again for a different aircraft it
+    produced the identical eight items.
+
+    An instruction is a request. This is a test: given the answer and the
+    index, it reports which citations resolve, which do not, and which
+    lines assert something without citing anything at all. A caller can
+    then refuse to render the answer rather than pass it on.
+
+    Line-based rather than sentence-based, because a checklist is a list
+    and the unit a reader trusts or distrusts is the item.
+    """
+    cited: List[str] = []
+    unknown: List[str] = []
+    unsupported: List[str] = []
+    supported: List[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        ids = CITATION_PATTERN.findall(stripped)
+        if ids:
+            for chunk_id in ids:
+                cited.append(chunk_id)
+                (supported if index.by_id(chunk_id) else unknown).append(chunk_id)
+            continue
+
+        # An item is a numbered or bulleted line. Prose around the list --
+        # a preamble, a caveat, a closing note -- is not an assertion
+        # about procedure and does not need a source.
+        if re.match(r"^([-*+]|\d+[.)])\s+\S", stripped):
+            unsupported.append(stripped)
+
+    return CitationCheck(
+        cited=cited, unknown=unknown, unsupported=unsupported, supported=supported
+    )
+
+
 def _read_cache(path: Optional[Path]) -> Dict[str, List[float]]:
     if path is None or not path.is_file():
         return {}

@@ -855,6 +855,24 @@ def plan_flight(
                 f"Too short to reach the planned cruise level -- the flight "
                 f"tops out around {phases.cruise_altitude_ft:,.0f} ft."
             )
+        # THE REMINDER GOES WHERE THE FAILURE HAPPENED. Asked to "plan a
+        # flight from KSFO to KEWR on a 777, and give checklist", the
+        # model planned the route and then wrote an eight-item checklist
+        # from memory -- "file a flight plan with air traffic control",
+        # "obtain clearance for takeoff" -- none of it in the corpus and
+        # none of it cited. Asked again for an A320 it produced the
+        # IDENTICAL eight items, which is the tell: nothing derived them
+        # from anything.
+        #
+        # The system prompt already forbade this. It was ignored because
+        # by the time the plan came back, the checklist had become an
+        # afterthought. A note in the result arrives at that moment
+        # instead of thousands of tokens earlier.
+        result["checklist_note"] = (
+            "This plan contains no checklist. If the user asked what to "
+            "check, or for a briefing, call find_procedures -- do not write "
+            "one from memory."
+        )
         result["ete_note"] = (
             "Report the time as written in `ete_spoken`; do not reformat "
             "`ete`. ETE is airborne time from takeoff to landing and "
@@ -1362,9 +1380,13 @@ def find_procedures(
         ],
         "note": (
             "Write the checklist using ONLY these procedures. Cite the `id` of "
-            "the procedure each item came from, like [fuel-reserves]. If "
-            "something a pilot would want is not covered here, say it is not "
-            "covered rather than supplying it from memory."
+            "the procedure each item came from, like [fuel-reserves]; an item "
+            "you cannot cite is an item you must not write. If the user asked "
+            "about a specific situation these procedures do not address, say "
+            "so in your FIRST sentence before offering related material -- do "
+            "not relabel general emergency procedures as advice about their "
+            "situation. If something a pilot would want is missing, say it is "
+            "not covered rather than supplying it from memory."
         ),
     }
 
