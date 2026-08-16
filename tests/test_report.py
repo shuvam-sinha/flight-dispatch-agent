@@ -313,3 +313,79 @@ class TestFigureUnitsAndLabels(unittest.TestCase):
     def test_labels_read_as_headings(self):
         self.assertEqual(self.label("cruise_altitude_ft"), "Cruise altitude")
         self.assertEqual(self.label("origin_elevation_ft"), "Origin elevation")
+
+
+class TestGreatCirclePath(unittest.TestCase):
+    """THE BUG THIS FIXES.
+
+    The reference course was drawn from two points -- origin and
+    destination -- and Leaflet joined them with a straight line on
+    screen. That is a rhumb line, not a great circle, and the two diverge
+    enormously at high latitude.
+
+    San Francisco to Dubai made it plain: the real great circle crosses
+    the Arctic, and the two-point line ran across the Atlantic and
+    Africa. The map showed a dashed "direct course" labelled 7,030 nm
+    beside a route labelled 7,290 nm, with the route apparently detouring
+    thousands of miles north for nothing. The route was right; the
+    reference line was a different path entirely.
+    """
+
+    def path(self, lat1, lon1, lat2, lon2):
+        from flight_dispatch.mapping import great_circle_path
+
+        return great_circle_path(lat1, lon1, lat2, lon2)
+
+    def points(self, *args):
+        return [point for segment in self.path(*args) for point in segment]
+
+    def test_the_direct_course_is_not_two_points(self):
+        self.assertGreater(len(self.points(37.6, -122.4, 25.3, 55.4)), 20)
+
+    def test_san_francisco_to_dubai_crosses_the_arctic(self):
+        # A straight line on the screen would never leave the
+        # mid-latitudes; the actual great circle goes over the pole.
+        highest = max(lat for lat, _ in self.points(37.6, -122.4, 25.3, 55.4))
+        self.assertGreater(highest, 80)
+
+    def test_it_still_starts_and_ends_where_it_should(self):
+        points = self.points(37.6, -122.4, 25.3, 55.4)
+        self.assertAlmostEqual(points[0][0], 37.6, delta=0.1)
+        self.assertAlmostEqual(points[-1][1], 55.4, delta=0.1)
+
+    def test_a_short_route_is_still_nearly_straight(self):
+        # The correction must not distort what was already right.
+        points = self.points(42.0, -88.0, 45.0, -93.0)
+        latitudes = [lat for lat, _ in points]
+        self.assertLess(max(latitudes) - 45.0, 0.5)
+
+
+class TestAntimeridianSplitting(unittest.TestCase):
+    """Leaflet joins points by the shorter path across the SCREEN, not
+    the globe. A step from 179E to 179W is two degrees of travel and 358
+    of screen, so an uncut path draws a line back across the whole map.
+    """
+
+    def split(self, points):
+        from flight_dispatch.mapping import split_at_antimeridian
+
+        return split_at_antimeridian(points)
+
+    def test_an_ordinary_path_is_one_segment(self):
+        self.assertEqual(len(self.split([(40, -90), (41, -89), (42, -88)])), 1)
+
+    def test_a_dateline_crossing_is_split(self):
+        self.assertEqual(len(self.split([(50, 179), (50, -179)])), 2)
+
+    def test_every_point_survives_the_split(self):
+        points = [(50, 178), (50, 179), (50, -179), (50, -178)]
+        kept = [point for segment in self.split(points) for point in segment]
+        self.assertEqual(len(kept), len(points))
+
+    def test_anchorage_to_tokyo_is_split(self):
+        from flight_dispatch.mapping import great_circle_path
+
+        self.assertGreater(len(great_circle_path(61.17, -150.0, 35.55, 139.78)), 1)
+
+    def test_a_single_point_does_not_crash(self):
+        self.assertEqual(self.split([(40, -90)]), [[(40, -90)]])

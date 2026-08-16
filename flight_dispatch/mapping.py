@@ -19,7 +19,7 @@ dependency of the CLI rather than of the engine.
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .geo import haversine_nm, initial_bearing_deg
+from .geo import great_circle_point, haversine_nm, initial_bearing_deg
 from .models import Airport
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
@@ -80,6 +80,64 @@ def add_airspace(route_map_obj, volumes, folium=None) -> None:
             ).add_to(route_map_obj)
 
 
+# Points used to draw the direct course. A great circle is a straight
+# line only on a globe; every flat projection bends it, and Mercator
+# bends it most at high latitude.
+DIRECT_COURSE_SAMPLES = 64
+
+
+def split_at_antimeridian(points):
+    """Break a path wherever it crosses 180 degrees of longitude.
+
+    Leaflet joins consecutive points by the shorter path across the
+    SCREEN, not across the globe. A step from 179E to 179W is two degrees
+    of real travel and 358 degrees of screen, so an uncut path draws a
+    line straight back across the entire map.
+
+    Returns a list of paths to draw separately.
+    """
+    if len(points) < 2:
+        return [list(points)]
+
+    segments = [[points[0]]]
+    for previous, current in zip(points, points[1:]):
+        if abs(current[1] - previous[1]) > 180:
+            segments.append([current])
+        else:
+            segments[-1].append(current)
+
+    # Short segments are kept, including single points. Filtering them
+    # out lost a two-point path across the dateline entirely -- the line
+    # simply disappeared. A one-point polyline draws nothing, which is
+    # the honest result for a leg that cannot be shown on a flat map,
+    # and it keeps every point accounted for.
+    return segments
+
+
+def great_circle_path(lat1, lon1, lat2, lon2, samples=DIRECT_COURSE_SAMPLES):
+    """The direct course as something a flat map can draw honestly.
+
+    THE BUG THIS FIXES. The reference course was drawn from two points --
+    origin and destination -- and Leaflet joined them with a straight
+    line on screen. That is a rhumb line, not a great circle, and the two
+    diverge enormously at high latitude.
+
+    San Francisco to Dubai made it obvious. The real great circle crosses
+    the Arctic; the two-point line ran across the Atlantic and Africa. So
+    the map showed a dashed "direct course" labelled 7,030 nm beside a
+    route labelled 7,290 nm, with the route apparently detouring thousands
+    of miles north for no reason. The route was right and 103.7% of
+    direct; the reference line was a different path entirely.
+
+    Sampling the actual great circle draws the line the number refers to.
+    """
+    points = [
+        great_circle_point(index / samples, lat1, lon1, lat2, lon2)
+        for index in range(samples + 1)
+    ]
+    return split_at_antimeridian(points)
+
+
 def route_map(plan: "RoutePlan", airspace=None, zoom_padding: float = 0.15):
     """Build a folium Map showing a route plan.
 
@@ -113,24 +171,28 @@ def route_map(plan: "RoutePlan", airspace=None, zoom_padding: float = 0.15):
     if airspace:
         add_airspace(route_map_obj, airspace, folium)
 
-    # Great-circle reference course, origin straight to destination.
-    folium.PolyLine(
-        [(plan.origin.lat, plan.origin.lon), (plan.dest.lat, plan.dest.lon)],
-        color=DIRECT_COLOR,
-        weight=2,
-        opacity=0.8,
-        dash_array="8,8",
-        tooltip=f"Direct course: {plan.direct_distance_nm:.1f} nm",
-    ).add_to(route_map_obj)
+    # Great-circle reference course, sampled rather than drawn end to end.
+    for segment in great_circle_path(
+        plan.origin.lat, plan.origin.lon, plan.dest.lat, plan.dest.lon
+    ):
+        folium.PolyLine(
+            segment,
+            color=DIRECT_COLOR,
+            weight=2,
+            opacity=0.8,
+            dash_array="8,8",
+            tooltip=f"Direct course: {plan.direct_distance_nm:.1f} nm",
+        ).add_to(route_map_obj)
 
     # The route actually flown, waypoint to waypoint.
-    folium.PolyLine(
-        list(zip(lats, lons)),
-        color=ROUTE_COLOR,
-        weight=3.5,
-        opacity=0.9,
-        tooltip=f"Route: {plan.total_distance_nm:.1f} nm",
-    ).add_to(route_map_obj)
+    for segment in split_at_antimeridian(list(zip(lats, lons))):
+        folium.PolyLine(
+            segment,
+            color=ROUTE_COLOR,
+            weight=3.5,
+            opacity=0.9,
+            tooltip=f"Route: {plan.total_distance_nm:.1f} nm",
+        ).add_to(route_map_obj)
 
     _add_waypoint_markers(folium, route_map_obj, plan)
 
