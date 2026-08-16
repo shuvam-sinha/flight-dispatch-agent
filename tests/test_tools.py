@@ -1062,3 +1062,69 @@ class TestFactsAndInstructionsAreSeparate(unittest.TestCase):
 
         self.assertIn("underscore", DEFAULT_SYSTEM_PROMPT)
         self.assertIn("never quote", DEFAULT_SYSTEM_PROMPT.lower())
+
+
+class TestSaveReport(unittest.TestCase):
+    """The report is the artefact; the model's summary is a convenience.
+
+    The model summarises selectively -- a range warning became "a warning
+    has been issued", airspace was dropped from a reply entirely. The
+    report renders every field in full and refuses to include a checklist
+    item that cites nothing.
+    """
+
+    def plan(self, **kwargs):
+        arguments = {
+            "origin": "KPWK",
+            "dest": "KMSP",
+            "aircraft": "sr22",
+            "use_wind": False,
+        }
+        arguments.update(kwargs)
+        return dispatch("plan_flight", arguments)
+
+    def test_no_report_unless_asked(self):
+        self.assertNotIn("report_file", self.plan())
+
+    def test_a_report_is_written_and_its_path_returned(self):
+        from pathlib import Path
+
+        result = self.plan(save_report=True)
+        self.assertNotIn("report_error", result)
+        self.assertTrue(Path(result["report_file"]).is_file())
+        self.assertTrue(
+            Path(result["report_file"].replace(".html", ".json")).is_file()
+        )
+
+    def test_the_filename_identifies_the_flight(self):
+        path = self.plan(save_report=True)["report_file"]
+        self.assertIn("kpwk", path)
+        self.assertIn("kmsp", path)
+        self.assertIn("sr22", path)
+
+    def test_the_model_is_told_to_give_the_user_the_path(self):
+        # It cannot open the file itself, exactly as with the map.
+        self.assertIn("path", self.plan(save_report=True)["report_note"])
+
+    def test_the_report_carries_the_route(self):
+        import json
+        from pathlib import Path
+
+        result = self.plan(save_report=True)
+        data = json.loads(
+            Path(result["report_file"].replace(".html", ".json")).read_text()
+        )
+        self.assertEqual(data["route"], result["route"])
+
+    def test_the_parameter_reaches_both_backends(self):
+        # A boolean, so it survives Apple's schema as well as JSON Schema.
+        spec = TOOLS_BY_NAME["plan_flight"].parameters["save_report"]
+        self.assertEqual(spec["type"], "boolean")
+
+    def test_a_failed_report_does_not_lose_the_plan(self):
+        from unittest.mock import patch
+
+        with patch("flight_dispatch.report.build_report", side_effect=OSError("disk")):
+            result = self.plan(save_report=True)
+        self.assertIn("route", result)
+        self.assertIn("report_error", result)

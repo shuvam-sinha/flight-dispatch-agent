@@ -194,7 +194,12 @@ def format_arguments(call: ToolCall) -> str:
     `use_wind=True avoid_airspace=True save_map=False` on every call is
     noise; only non-default values are interesting.
     """
-    hidden = {"use_wind": True, "avoid_airspace": True, "save_map": False}
+    hidden = {
+        "use_wind": True,
+        "avoid_airspace": True,
+        "save_map": False,
+        "save_report": False,
+    }
     parts = [
         f"{key}={value!r}"
         for key, value in call.arguments.items()
@@ -211,6 +216,8 @@ def summarise_result(result: ToolResult) -> str:
         return red(f"error: {content['error']}")
 
     if result.name == "plan_flight":
+        if content.get("report_file"):
+            return f"{content.get('route', '')}  ->  {content['report_file']}"
         pieces = [content.get("route", "")]
         if "route_distance_nm" in content:
             pieces.append(f"{content['route_distance_nm']} nm")

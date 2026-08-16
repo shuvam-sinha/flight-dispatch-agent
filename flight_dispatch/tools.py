@@ -539,6 +539,7 @@ def plan_flight(
     altitude_ft: Optional[Any] = None,
     payload_lb: Optional[float] = None,
     save_map: bool = False,
+    save_report: bool = False,
 ) -> Dict[str, Any]:
     """Plan a route. The primary tool -- everything else supports it.
 
@@ -804,6 +805,59 @@ def plan_flight(
             )
         except Exception as exc:  # noqa: BLE001 - a failed map must not lose the plan
             result["map_error"] = f"Route planned, but the map failed: {exc}"
+
+    if save_report:
+        # THE REPORT IS THE ARTEFACT. Everything above is a dict the model
+        # will summarise, and it summarises selectively -- a range warning
+        # became "a warning has been issued", airspace was dropped
+        # entirely. The report renders every field, in full, and refuses
+        # to include a checklist item that cites nothing. What the model
+        # says is a convenience; this is the record.
+        try:
+            from .report import build_report
+
+            filename = (
+                f"reports/{origin_airport.icao}_{dest_airport.icao}_"
+                f"{profile.key}.html"
+            ).lower()
+
+            procedures, figures, checklist_text = [], {}, ""
+            try:
+                retrieved = find_procedures(
+                    aircraft=profile.key,
+                    phase="preflight",
+                    origin=origin_airport.icao,
+                    dest=dest_airport.icao,
+                )
+                if "error" not in retrieved:
+                    procedures = retrieved["procedures"]
+                    figures = retrieved.get("figures", {})
+                    # Quoted, not summarised: there is no model in this
+                    # path, and phrasing them here would be the invention
+                    # the whole design forbids.
+                    checklist_text = "\n".join(
+                        f"- {item['text'].strip().split('. ')[0]} [{item['id']}]"
+                        for item in procedures
+                    )
+            except Exception:  # noqa: BLE001 - the checklist is optional
+                pass
+
+            written = build_report(
+                plan,
+                checklist_text=checklist_text,
+                procedures=procedures,
+                figures=figures,
+            ).write(
+                filename,
+                airspace=airspace_index.volumes if airspace_index else None,
+            )
+            result["report_file"] = written["html"]
+            result["report_note"] = (
+                f"Full dispatch report written to {written['html']} -- route, "
+                "map, figures and a cited checklist. Give the user the path."
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed report keeps the plan
+            result["report_error"] = f"Route planned, but the report failed: {exc}"
 
     # Time, fuel and range are always reported. With wind applied they
     # come from the search itself, since cost IS time there. Without it,
@@ -1575,6 +1629,16 @@ TOOLS: List[ToolSpec] = [
             "payload_lb": {
                 "type": "number",
                 "description": "Payload in pounds. Defaults to typical occupancy for the aircraft.",
+                "required": False,
+            },
+            "save_report": {
+                "type": "boolean",
+                "description": (
+                    "Write a full dispatch report as HTML and JSON -- route, "
+                    "map, figures and a cited preflight checklist. Set true "
+                    "when the user asks for a report, a briefing document, or "
+                    "something they can open or share."
+                ),
                 "required": False,
             },
             "save_map": {
