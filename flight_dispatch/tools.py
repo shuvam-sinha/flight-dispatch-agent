@@ -1325,6 +1325,57 @@ def _checklist_query(profile, origin_airport, dest_airport, phase: str) -> str:
     return " ".join(terms)
 
 
+def _flight_figures(profile, origin_airport, dest_airport) -> Dict[str, Any]:
+    """Computed numbers a procedure can be anchored to.
+
+    WHY THIS EXISTS. Retrieval selects text; it does not write it. So
+    `fuel-reserves` reads identically whether the flight is a Cessna hop
+    across Illinois or a 777 to Newark:
+
+        "Compute what the flight requires, add the reserve, and only
+         then ask whether the aircraft can carry it."
+
+    True, cited, and not about your flight. The document states the RULE;
+    what was missing is where THIS flight sits against it. Both halves
+    are grounded -- the rule in a procedure document, the numbers in the
+    aircraft profile and the airport records -- so anchoring one to the
+    other invents nothing:
+
+        "Carry 45 minutes of reserve [fuel-reserves]. That is 1,853 gal
+         for this aircraft, against 47,890 gal of capacity."
+
+    Derived from the profile and the airports rather than from a route
+    plan, so this stays cheap: building a mesh and running A* to write a
+    checklist would cost seconds and duplicate work `plan_flight`
+    already did.
+    """
+    figures: Dict[str, Any] = {
+        "usable_fuel_gal": round(profile.usable_fuel_gal),
+        "reserve_gal": round(profile.reserve_gal),
+        "reserve_minutes": round(profile.reserve_minutes),
+        "endurance_hours": round(profile.endurance_hours(), 1),
+        "still_air_range_nm": round(profile.range_nm()),
+        "useful_load_lb": round(profile.useful_load_lb),
+        "typical_payload_lb": round(profile.typical_payload_lb),
+        "max_fuel_with_typical_payload_gal": round(profile.max_fuel_gal()),
+        "cruise_altitude_ft": round(profile.cruise_altitude_ft),
+        "service_ceiling_ft": round(profile.service_ceiling_ft),
+    }
+
+    if origin_airport is not None and dest_airport is not None:
+        figures["direct_distance_nm"] = round(
+            haversine_nm(
+                origin_airport.lat, origin_airport.lon,
+                dest_airport.lat, dest_airport.lon,
+            ),
+            1,
+        )
+        figures["origin_elevation_ft"] = round(origin_airport.elevation_ft or 0)
+        figures["destination_elevation_ft"] = round(dest_airport.elevation_ft or 0)
+
+    return figures
+
+
 def find_procedures(
     aircraft: str,
     phase: str = "preflight",
@@ -1379,6 +1430,7 @@ def find_procedures(
         "phase": phase,
         "query": query,
         "conditions": conditions,
+        "figures": _flight_figures(profile, origin_airport, dest_airport),
         "procedures": [
             {
                 "id": match.chunk.id,
@@ -1397,7 +1449,12 @@ def find_procedures(
             "so in your FIRST sentence before offering related material -- do "
             "not relabel general emergency procedures as advice about their "
             "situation. If something a pilot would want is missing, say it is "
-            "not covered rather than supplying it from memory."
+            "not covered rather than supplying it from memory. Where a "
+            "procedure states a rule that `figures` can be measured "
+            "against, give the number: the document says what the rule "
+            "is, the figure says where this flight sits against it. Use "
+            "ONLY the numbers in `figures` -- do not compute or estimate "
+            "others."
         ),
     }
 

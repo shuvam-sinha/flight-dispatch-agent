@@ -543,3 +543,83 @@ class TestChecklistReminder(unittest.TestCase):
 
     def test_the_note_forbids_writing_one_from_memory(self):
         self.assertIn("from memory", self.plan()["checklist_note"])
+
+
+class TestFlightFigures(unittest.TestCase):
+    """Retrieval selects text; it does not write it, so `fuel-reserves`
+    reads identically for a Cessna hop and a 777 to Newark. The document
+    states the RULE; these numbers say where THIS flight sits against it.
+
+    Both halves are grounded -- the rule in a procedure document, the
+    figures in the aircraft profile and the airport records -- so
+    anchoring one to the other invents nothing.
+    """
+
+    def figures(self, aircraft_key, origin=None, dest=None):
+        from flight_dispatch.aircraft import get_aircraft
+        from flight_dispatch.data_loader import load_airports
+        from flight_dispatch.tools import _flight_figures
+
+        airports = load_airports()
+        return _flight_figures(
+            get_aircraft(aircraft_key),
+            airports.get(origin) if origin else None,
+            airports.get(dest) if dest else None,
+        )
+
+    def test_figures_differ_by_aircraft(self):
+        self.assertNotEqual(self.figures("c172"), self.figures("b77w"))
+
+    def test_fuel_figures_match_the_profile(self):
+        from flight_dispatch.aircraft import get_aircraft
+
+        profile = get_aircraft("b77w")
+        figures = self.figures("b77w")
+        self.assertEqual(figures["usable_fuel_gal"], round(profile.usable_fuel_gal))
+        self.assertEqual(figures["reserve_gal"], round(profile.reserve_gal))
+
+    def test_route_figures_appear_only_with_both_airports(self):
+        self.assertNotIn("direct_distance_nm", self.figures("c172"))
+        self.assertIn("direct_distance_nm", self.figures("c172", "KPWK", "KMSP"))
+
+    def test_distance_matches_the_geometry(self):
+        from flight_dispatch.data_loader import load_airports
+        from flight_dispatch.geo import haversine_nm
+
+        airports = load_airports()
+        origin, dest = airports["KSFO"], airports["KEWR"]
+        self.assertAlmostEqual(
+            self.figures("b77w", "KSFO", "KEWR")["direct_distance_nm"],
+            haversine_nm(origin.lat, origin.lon, dest.lat, dest.lon),
+            places=1,
+        )
+
+    def test_elevation_comes_from_the_airport_record(self):
+        self.assertGreater(
+            self.figures("b738", "KDEN", "KMCI")["origin_elevation_ft"], 5000
+        )
+
+    def test_no_route_planning_happens(self):
+        # These must stay cheap: building a mesh and running A* to write
+        # a checklist would cost seconds and duplicate plan_flight.
+        import time
+
+        start = time.time()
+        self.figures("b77w", "KSFO", "KEWR")
+        self.assertLess(time.time() - start, 0.5)
+
+    def test_the_tool_returns_them(self):
+        from flight_dispatch.tools import dispatch
+
+        result = dispatch(
+            "find_procedures",
+            {"aircraft": "b77w", "origin": "KSFO", "dest": "KEWR"},
+        )
+        self.assertIn("figures", result)
+        self.assertIn("reserve_gal", result["figures"])
+
+    def test_the_note_forbids_inventing_other_numbers(self):
+        from flight_dispatch.tools import dispatch
+
+        result = dispatch("find_procedures", {"aircraft": "c172"})
+        self.assertIn("ONLY the numbers", result["note"])
