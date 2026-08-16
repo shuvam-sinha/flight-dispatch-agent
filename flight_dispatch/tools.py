@@ -257,12 +257,12 @@ def _match_rank(airport, needle: str = "", runway_area: float = 0.0) -> tuple:
 
     Four real signals, in priority order:
 
-      TYPE. large_airport (1,172 of 85,825) versus small_airport
-        (42,700). The single strongest discriminator in the dataset.
-      SCHEDULED SERVICE. 4,365 airports carry commercial airline
+      TYPE. large_airport (1,172 of 72,417) versus small_airport
+        (42,674). The single strongest discriminator in the dataset.
+      SCHEDULED SERVICE. 4,357 airports carry commercial airline
         service. If a passenger could book a flight there, it is almost
         certainly what they meant.
-      IATA CODE. 9,054 have one. Presence signals commercial relevance;
+      IATA CODE. 9,052 have one. Presence signals commercial relevance;
         an airstrip does not get an IATA code.
       MUNICIPALITY MATCH. Someone typing "San Francisco" usually means
         the airport serving that city, not one that happens to share the
@@ -332,7 +332,7 @@ def _search_index() -> List:
     """Airports paired with their searchable text, built once.
 
     Every name, city, IATA and ICAO code a person might use, normalised.
-    85,825 airports is enough that rebuilding this per query would show
+    72,417 airports is enough that rebuilding this per query would show
     up in a conversation's latency.
 
     `keywords` is included because it is where OurAirports keeps the

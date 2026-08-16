@@ -144,8 +144,9 @@ plan_route.py   CLI          dispatch.py   conversational REPL
 
 ### The data
 
-85,825 airports and 11,009 navaids from OurAirports, plus 780 FAA special-use
-airspace volumes. `geo.py` holds no project types, so everything above reuses
+72,417 airports and 10,841 navaids from OurAirports — out of 85,825 and 11,008
+rows, the rest lacking a usable identifier or coordinates — plus 780 FAA
+special-use airspace volumes. `geo.py` holds no project types, so everything above reuses
 it: haversine distance, initial bearing, signed cross/along-track
 decomposition, great-circle interpolation and destination-point projection, and
 antimeridian-safe bounding boxes.
@@ -545,14 +546,48 @@ clusters by open water. `_bridge_components` joins them with a union-find pass.
 
 **`find_airport` was wrong in five different ways.** It sorted by name length,
 so a Mexican airstrip literally named "San Francisco" outranked SFO — and the
-agent planned a flight from it. Ranking now uses real signals: airport type,
-scheduled service, IATA code, city match, then total runway area. That last one
-replaced longest-single-runway, which ranked Al Maktoum above Dubai
-International on a runway 174 ft longer at an airport with almost no traffic.
+agent planned a flight from it.
+
+Ranking is now a tuple compared element by element, so it is strict priority
+rather than a weighted score with constants to tune. Every field is a real
+column in the data:
+
+```python
+(airport_type,        # large_airport (1,172) before small_airport (42,674)
+ not scheduled_service,   # 4,357 carry commercial service
+ not iata_code,           # 9,052 have one; an airstrip does not
+ not municipality_match,  # "San Francisco" the city, not the name
+ -total_runway_area,      # every open runway, length × width
+ len(name))               # last resort, all it was ever suited for
+```
+
+The first match wins on the first field that separates them. Worked through:
+
+```
+"chicago"
+KORD  (0, False, False, False, -12,634,250, 36)
+KMDW  (0, False, False, False,  -3,002,640, 36)   ← ties four fields, loses on area
+KRFD  (1, False, False, False,  -2,730,300, 38)   ← medium_airport, out on field one
+```
+
+Runway *area* replaced longest-single-runway, which ranked Al Maktoum above
+Dubai International on a strip 174 ft longer at an airport with almost no
+traffic. Counting every runway tracks how much aircraft a field can actually
+handle: 12 of 15 multi-airport cities came out right on longest runway, 14 on
+total area.
+
 Matching was wrong too: `New York JFK` matched nothing (city and code live in
 different columns), `Sao Paulo` matched nothing (accents), and `JFK` matched
-nothing (IATA codes aren't substrings of names). Across 45 major world cities
-the ranker now returns the expected airport 44 times.
+nothing (IATA codes aren't substrings of names). Search now widens through exact
+ICAO, exact IATA, phrase, all-words-anywhere, best partial match, and a
+spacing-blind compare — each pass *widening* rather than replacing, because
+"Los Angeles airport" is contained in "Hilton Los Angeles Airport Helipad" and
+not in "Los Angeles International Airport".
+
+Across 45 major world cities the ranker now returns the expected airport 44
+times. The exception is Mexico City, where Felipe Ángeles has four runways and
+almost no traffic against Benito Juárez's two — no runway metric separates them,
+and this dataset carries no passenger figures.
 
 **A schema constraint cascaded three times.** Apple's format cannot express an
 optional parameter, so every parameter offered gets filled — the model invented
