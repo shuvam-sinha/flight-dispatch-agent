@@ -5,17 +5,27 @@ mission request, an agent orchestrates real routing, weather, and airspace tools
 to produce a flight plan, plus a grounded preflight checklist and an interactive
 map.
 
-The core design principle is that **the LLM never does computation**. All
+The core design principle is that **the model never does computation**. All
 routing, weather and airspace logic lives in deterministic Python functions that
-work independently of any model. The LLM decides which tool to call and
-synthesises the results — every number it reports comes from real tool output.
+work independently of any model. The model decides which tool to call and
+synthesises the results — every number it reports comes from real tool output,
+and every checklist item from a document that can be opened.
+
+Building it turned that rule into a stricter one. Five separate failures were
+computations that came out right and were then corrupted in the last step —
+misread, mislabelled, reformatted, retyped. So the rule is now **the model never
+*derives* anything**: not arithmetic, not interpretation, not a unit conversion.
+Tool results state finished conclusions in prose, and anything a reader could
+draw the opposite conclusion from is a sentence rather than a value. The "Bugs
+worth recording" section below is mostly the evidence for that.
 
 ## Status
 
-**Checkpoints 1–4 complete.** A\* routing over a waypoint mesh built from real
-navaid data, with flight time as the cost function, live global winds aloft, FAA
-restricted-airspace avoidance, a virtual routing grid for oceanic legs, and a
-conversational dispatcher agent that runs against two local model backends.
+**Working end to end.** A\* routing over a waypoint mesh built from real navaid
+data, with flight time as the cost function, live global winds aloft, FAA
+restricted-airspace avoidance, a virtual routing grid for oceanic legs, a
+conversational agent running against two local model backends, a
+retrieval-grounded preflight checklist, and a self-contained HTML report.
 
 ## Setup
 
@@ -98,11 +108,13 @@ Mesh graph:      149 nodes, 2747 edges; A* expanded 44
 | `--avoid-airspace` | off | Route around FAA prohibited/restricted/warning areas |
 | `--radius-nm` | 150 | Mesh edge connection radius |
 | `--map [PATH]` | — | Interactive HTML map with airspace overlay |
-| `--naive` | off | CP1's corridor sampler, for comparison |
+| `--naive` | off | The earlier corridor sampler, for comparison |
 | `--no-grid` | grid on | Disable virtual oceanic waypoints |
+| `--report [PATH]` | — | Full dispatch report as HTML and JSON |
+| `--checklist` | off | Add a retrieved, cited preflight checklist to the report |
 
 ```bash
-python -m unittest discover tests      # 470 tests
+python -m unittest discover tests      # 598 tests
 ```
 
 ## Layout
@@ -126,7 +138,10 @@ aircraft.py     47 performance profiles
 phases.py       climb / cruise / descent split
 route.py        plan_route() — ties the above into a RoutePlan
   ↓
-tools.py        the five tools, as ToolSpecs with English descriptions
+retrieval.py    procedure corpus, embeddings, cosine search
+report.py       the HTML/JSON dispatch report
+  ↓
+tools.py        the six tools, as ToolSpecs with English descriptions
 agent.py        the loop; ModelBackend protocol
 backend_apple.py    on-device Foundation Models
 backend_ollama.py   a larger local model — and the one the loop drives
@@ -134,19 +149,20 @@ backend_ollama.py   a larger local model — and the one the loop drives
 plan_route.py   CLI          dispatch.py   conversational REPL
 ```
 
-## What each checkpoint demonstrates
+## How it works
 
-### CP1 — data ingestion
+### The data
 
-Loads 85,825 airports and 11,009 navaids from OurAirports CSVs. The geometry
-module (`geo.py`) holds no project types, so everything downstream reuses it:
-haversine distance, initial bearing, signed cross/along-track decomposition,
-great-circle interpolation, and antimeridian-safe bounding boxes.
+85,825 airports and 11,009 navaids from OurAirports, plus 780 FAA special-use
+airspace volumes. `geo.py` holds no project types, so everything above reuses
+it: haversine distance, initial bearing, signed cross/along-track
+decomposition, great-circle interpolation and destination-point projection, and
+antimeridian-safe bounding boxes.
 
-### CP2 — A\* over a waypoint mesh
+### Routing: A\* over a waypoint mesh
 
 `graph.py` builds a mesh per request over the region between origin and
-destination: nodes are navaids plus the two airports, edges connect anything
+destination — nodes are navaids plus the two airports, edges connect anything
 within the radius. A k-nearest floor prevents isolated nodes, and component
 bridging joins clusters separated by open water, so the graph is always
 connected.
@@ -155,20 +171,15 @@ connected.
 admissible by construction — no route between two points is shorter than the
 straight line — so the result is provably optimal.
 
-The payoff over CP1's corridor sampling is immediate: `KPWK→KORD` went from
-21.8 nm (267% of direct) to 8.1 nm.
-
 **Verification:** matched against exhaustive brute-force search on 400 random
 graphs with zero mismatches, and against Dijkstra on real routes — identical
 costs, far fewer nodes expanded (KPWK→KMSP: 3 vs 216).
 
-### CP3 — wind and airspace
-
-**Cost becomes time, not distance:**
+### Cost is time, not distance
 
 ```
-CP2:  cost = distance_nm
-CP3:  cost = distance_nm / ground_speed_kt
+distance-only:  cost = distance_nm
+wind-aware:     cost = distance_nm / ground_speed_kt
 ```
 
 Ground speed is not airspeed. The aircraft flies through air that is itself
@@ -176,69 +187,115 @@ moving, so the shortest route stops being the fastest one. On a banded wind
 field, `KPWK→KMSP` chose a route 8.6 nm longer that arrives 13 minutes sooner.
 
 Changing the cost units meant the heuristic had to change too — distance in
-nautical miles is not a lower bound on hours. `a_star` takes a `distance_to_cost`
-converter, and the time version divides by TAS plus the strongest wind in the
-graph, which is the best ground speed physically achievable and therefore a
-valid lower bound.
+nautical miles is not a lower bound on hours. `a_star` takes a
+`distance_to_cost` converter, and the time version divides by TAS plus the
+strongest wind in the graph, which is the best ground speed physically
+achievable and therefore a valid lower bound.
 
-**Winds:** live global forecasts from Open-Meteo. Coordinates are batched,
-snapped to a grid and cached, so a 78,707-edge mesh collapses to a few hundred
-cells and a handful of concurrent HTTP requests. `WindSource` is a narrow protocol, so alternative
-backends drop in without the router knowing.
+Wind is sampled per leg and per segment within a leg, with the course
+recomputed each time: a 150 nm edge can start in a headwind and end in a
+crosswind, and on a great circle the heading changes continuously.
 
-**Airspace:** 780 blocking FAA volumes, indexed with an STRtree. An edge
-crossing prohibited airspace costs `math.inf`, and A\* routes around it — no
-avoidance algorithm required, which is what the `cost_function` hook was for.
-Altitude bands are respected: 501 volumes are active at 8,000 ft, 235 at
-41,000 ft.
+### Airspace, for free
+
+780 blocking FAA volumes, indexed with an STRtree. An edge crossing prohibited
+airspace costs `math.inf`, and A\* routes around it — no avoidance algorithm
+required, which is what the `cost_function` hook was for. Altitude bands are
+respected: 501 volumes are active at 8,000 ft, 235 at 41,000 ft.
 
 ```
 KLAX→KSLC   unrestricted   crosses 9 restricted areas    515.8 nm
             avoiding       crosses 0                     536.6 nm
 ```
 
-**Aircraft:** 47 profiles from a Cessna 172 to an A380, with fuel and payload
-trading against maximum takeoff weight — the constraint a payload-range diagram
-describes. A 787-8 with 248 passengers can load 27,379 of its 33,340 gallons,
-giving ~7,140 nm against a published ~7,300.
+### Aircraft
 
-### CP4 — the dispatcher agent
+47 profiles from a Cessna 172 to an A380, with fuel and payload trading against
+maximum takeoff weight — the constraint a payload-range diagram describes. A
+787-8 with 248 passengers can load 27,379 of its 33,340 gallons, giving ~7,140
+nm against a published ~7,300.
 
-Adding a conversational agent on top of CP1–CP3 took **3,314 added lines and 17
-deleted ones**. Nothing in `geo.py`, `search.py`, `graph.py`, `cost.py` or
-`airspace.py` had to change — the routing engine does not know a model is
-calling it. That was the whole bet of the architecture, and it paid.
+### The agent
 
-**The tool surface** (`tools.py`) wraps the CP1–CP3 functions in five tools:
+The routing engine was written and tested before any model existed, and adding
+the agent on top of it took **3,314 added lines and 17 deleted ones**. Nothing
+in `geo.py`, `search.py`, `graph.py`, `cost.py` or `airspace.py` had to change —
+the engine does not know a model is calling it. That was the bet of the
+architecture, and it paid.
+
+Six tools wrap the engine:
 
 | Tool | What it does |
 | --- | --- |
 | `find_airport` | ICAO code, name, or city → airport, ranked by significance |
 | `list_aircraft` | The 47 profiles, with cruise speed, altitude, seats, range |
-| `plan_flight` | Full plan: route, waypoints, ETE, fuel |
+| `plan_flight` | Full plan: route, waypoints, ETE, fuel, optional map and report |
 | `get_winds_aloft` | Forecast wind at one point and altitude |
 | `check_airspace` | Restricted areas on the direct course between two airports |
+| `find_procedures` | Real procedure documents relevant to this flight |
 
 A `ToolSpec` holds a name, an English description, a parameter schema and a
-Python callable. `dispatch()` looks up the name, validates arguments, calls the
-function, and — critically — **returns errors as data rather than raising**. A
-model that gets `{"error": "unknown aircraft 'b737'"}` can correct itself on the
-next turn; an exception just kills the conversation.
+Python callable. `dispatch()` looks up the name, coerces arguments to their
+declared types, calls the function, and — critically — **returns errors as data
+rather than raising**. A model that gets `{"error": "unknown aircraft 'b737'"}`
+can correct itself on the next turn; an exception just kills the conversation.
 
-**The agent loop** (`agent.py`) is hand-written, ~40 lines at its core: send the
+`agent.py` is the loop, hand-written and about 40 lines at its core: send the
 conversation, check for tool calls, execute them, append the results, send
-again, repeat until the model answers in prose. `ModelBackend` is a three-method
-`Protocol`, so the loop is tested against a `ScriptedBackend` with no model and
-no network.
+again, repeat until the model answers in prose. `max_rounds` turns a model that
+never converges into a reported failure rather than an unbounded spend. A tool
+called twice with identical arguments, failing both times, gets an escalated
+error — the same message returned twice reads as the same situation, so the
+model tries the same thing again.
 
-**The backend** is Apple's on-device Foundation Models — free, private, no API
-key, and the model itself never touches the network.
+`ModelBackend` is a three-method `Protocol`, so the loop is tested against a
+`ScriptedBackend` with no model and no network, and runs against two real
+backends selected with `--backend`.
 
-### Planned
+### Retrieval, so the checklist cannot be invented
 
-- **CP5** — RAG checklist agent: a small embedded corpus, cosine retrieval, and
-  cited output
-- **CP6** — combined JSON/HTML dispatch report
+A checklist has three possible sources and two of them are bad. Hardcoded, it
+is a dictionary that cannot adapt to the flight. Written by the model, it is
+confident, plausible and invented.
+
+So: retrieve first, write only from what was retrieved, cite every item. It is
+the rule the routing tools already follow, applied to text instead of numbers —
+`plan_flight` guarantees every number came from a computation, `find_procedures`
+guarantees every procedure came from a document.
+
+Fifteen procedure documents live in `data/procedures` as plain markdown, so
+adding one changes the checklist with no code change and no retraining.
+Embeddings come from `nomic-embed-text` through the same local server the model
+backend uses, cached to disk by content hash. Cosine similarity over a list of
+fifteen vectors is exact and takes microseconds; a vector database here would be
+a dependency and a running service to search fewer items than a phone book page.
+
+Similarity alone was not enough. Asked for a Cessna departure, vector search
+ranked `night-flight` **first** — it is dense with light-aircraft language and
+genuinely was the most similar document, but nothing said the flight was at
+night. Seven of the fifteen documents now declare a precondition and are
+excluded before ranking unless it holds, with the conditions derived from real
+data: cruise altitude, field elevation, and the routing grid for open water.
+
+```
+777  KSFO→KEWR   high-altitude-cruise · fuel-reserves · engine-failure
+c172 KPWK→KMSP   engine-failure · preflight-inspection · crosswind-landing
+b738 KDEN→KMCI   density-altitude · mountain-flying · high-altitude-cruise
+```
+
+### The report
+
+Everything else is reachable only through a terminal, and a route that bends
+around restricted airspace is a number in a sentence until you can see it bend.
+`report.py` produces one self-contained HTML file — route, map, figures,
+checklist with citations — plus the same content as JSON.
+
+**The report enforces the citation rule rather than asking for it.** An item
+citing nothing does not enter the checklist, and neither does one citing a
+document that does not exist — a citation to nothing is worse than no citation,
+because it looks like provenance. Rejected items appear in their own section
+rather than being dropped: a silently cleaned report would look fully grounded
+while the model had been inventing.
 
 ## Design notes
 
@@ -261,8 +318,8 @@ returns a flight plan with almost no waypoints in it. 150 nm is the knee.
 NOAA's FD product on aviationweather.gov is the bulletin pilots read at
 preflight, and it was the first choice. It is fixed-width text covering ~218 US
 stations, with point data rather than a grid. This project routes globally and
-CP3's value shows most on long-haul flights, so gridded model data was the
-better fit — the same GFS/ECMWF runs that FD is derived from, served as JSON at
+wind routing shows its value most on long-haul flights, so gridded model data
+was the better fit — the same GFS/ECMWF runs that FD is derived from, served as JSON at
 any coordinate. `WindSource` exists so that decision can be revisited without
 touching the router.
 
@@ -304,13 +361,13 @@ two implementations, selected with `--backend`.
 Apple's SDK runs the tool loop itself, so `agent.py`'s hand-written loop makes
 one pass and exits. The orchestration was written, tested and documented — and
 never actually orchestrated. Ollama returns `tool_calls` for the caller to
-execute, exactly as the Claude API does, so the loop finally drives a real
+execute — the way a hosted chat API does — so the loop finally drives a real
 conversation. `send_tool_results` is asserted *unreachable* in the Apple tests
 and is exercised on every round here.
 
 `ToolSpec.json_schema()` needed no adaptation: Ollama takes OpenAI-style
-function schemas, which is what was already being rendered for Claude. The
-backend converts message shapes and nothing else.
+function schemas, which is the format `ToolSpec` already rendered. The backend
+converts message shapes and nothing else.
 
 Running identical tools against a 3B and an 8B model settled several open
 questions in one evening:
@@ -440,12 +497,13 @@ unchanged.
 
 ## Bugs worth recording
 
-Four of these came from running the assistant conversationally rather than from
-a test. Agents fail in ways unit tests do not reach.
+Most of these came from running the assistant conversationally rather than from
+a test. Agents fail in ways unit tests do not reach, and nearly every entry
+below was found by reading a real transcript.
 
 **Along-track distance was unsigned.** The textbook `acos` form returns 0–π, so
-a navaid *behind* the aircraft reported positive forward progress and CP1's
-corridor sampler happily selected waypoints in the wrong direction. Fixed by
+a navaid *behind* the aircraft reported positive forward progress, and the
+early corridor sampler happily selected waypoints in the wrong direction. Fixed by
 recovering the sign from `cos(θ₁₃ − θ₁₂)`.
 
 **The bounding box missed the great-circle bulge.** Sampling only the endpoints
@@ -485,7 +543,8 @@ planned a flight from it, which is the failure mode that matters: a wrong answer
 delivered fluently. Matches had been sorted by name length. Ranking now uses
 real significance signals: airport type, scheduled service, IATA code,
 municipality match, then longest runway (which meant finally opening the
-`runways.csv` that had been sitting in the data directory since CP1).
+`runways.csv` that had been sitting unopened in the data directory since the
+first day).
 
 **The size tiebreaker measured the wrong thing.** Among airports tied on type,
 scheduled service, IATA code and city, longest-single-runway decided — and it
@@ -664,8 +723,8 @@ precisely: the model is no longer inventing facts, it is making typos.
 still air and returned with a `wind_note` saying so. A degraded answer beats no
 answer.
 
-**Open-Meteo returned 429s** on batches of 100 coordinates. Reduced to 50, with
-retry and backoff honouring `Retry-After`.
+**Open-Meteo returned 429s** on batches of 100 coordinates. Reduced to 50, and
+the retry learned to read the server's own reason rather than assume one.
 
 ## Scope
 
@@ -686,12 +745,20 @@ wind-optimal routing works.
 
 Oceanic legs use generated lat/lon waypoints on the same naming convention real
 oceanic tracks use. The lattice is static, whereas real organised track systems
-are republished daily to follow the jet stream; feeding CP3's live winds into
-the grid layout is the natural next step.
+are republished daily to follow the jet stream; feeding the live winds into the
+grid layout is the natural next step.
 
 The on-device model's 4,096-token context holds roughly two conversational turns
-with the lean tool set. The `ModelBackend` protocol is the seam where a
-larger-context model drops in.
+with the lean tool set; the local 8B model has 32,768 and does not run out.
+`ModelBackend` is the seam where a larger model drops in.
+
+The procedure corpus is fifteen documents of general aviation practice, written
+for this project. Retrieval selects *which* apply to a flight and the report
+anchors them to that flight's computed figures, but the documents themselves say
+the same thing wherever they appear — retrieval selects text, it does not write
+it. Aircraft-specific manual excerpts would make the checklist concretely
+different between a 172 and a 777 rather than differing only in which topics
+appear.
 
 ## Verification
 
@@ -708,4 +775,11 @@ larger-context model drops in.
   `dispatch("plan_flight")` compared against direct `plan_route()` calls on a
   domestic hop, a transcontinental route and an ocean crossing — identical
   waypoints, distance, time, fuel and phase profile
-- **470 unit tests**
+- Retrieval ranking tested with hand-chosen vectors, so the ordering is verified
+  with no model, no network and no embedding service; live tests confirm that
+  "ice on the wing" reaches the icing document and "the engine has failed"
+  reaches engine failure
+- The report refuses uncited checklist items, verified against a real generated
+  answer containing one invented item and one citation to a document that does
+  not exist
+- **598 unit tests**

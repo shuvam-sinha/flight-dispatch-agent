@@ -60,6 +60,7 @@ from .data_loader import (
     navaids_near_route,
 )
 from .geo import haversine_nm, initial_bearing_deg
+from .grid import count_grid_points, waypoints_for_route
 from .route import NoRouteFound, plan_route
 from .wind import ConstantWindSource
 
@@ -538,6 +539,7 @@ def plan_flight(
     altitude_ft: Optional[Any] = None,
     payload_lb: Optional[float] = None,
     save_map: bool = False,
+    save_report: bool = False,
 ) -> Dict[str, Any]:
     """Plan a route. The primary tool -- everything else supports it.
 
@@ -724,10 +726,20 @@ def plan_flight(
     if len(plan.waypoints) <= MAX_DETAILED_WAYPOINTS:
         result["waypoints"] = _describe_waypoints(plan)
     else:
-        result["waypoints_omitted"] = (
-            f"{len(plan.waypoints)} waypoints -- per-leg detail omitted to stay "
-            "within context. Report the route string and the totals; offer the "
-            "map for detail."
+        # NAMED `_note` BECAUSE IT CARRIES AN INSTRUCTION. Called
+        # `waypoints_omitted`, the model read it as data and printed the
+        # whole string to the user, guidance included:
+        #
+        #     **Waypoints Omitted:** 23 waypoints -- per-leg detail
+        #     omitted to stay within context. Report the route string and
+        #     the totals; offer the map for detail.
+        #
+        # The other instruction-bearing fields are all `*_note` and none
+        # of them leaked. A reader treats a field named like data as data
+        # and a field named like a note as a note, and so does the model.
+        result["_waypoints_note"] = (
+            "Per-leg detail omitted to stay within context. Report the route "
+            "string and the totals; offer the map for detail."
         )
 
     # A SENTENCE, NOT A COUNT. This previously returned two fields --
@@ -794,6 +806,59 @@ def plan_flight(
         except Exception as exc:  # noqa: BLE001 - a failed map must not lose the plan
             result["map_error"] = f"Route planned, but the map failed: {exc}"
 
+    if save_report:
+        # THE REPORT IS THE ARTEFACT. Everything above is a dict the model
+        # will summarise, and it summarises selectively -- a range warning
+        # became "a warning has been issued", airspace was dropped
+        # entirely. The report renders every field, in full, and refuses
+        # to include a checklist item that cites nothing. What the model
+        # says is a convenience; this is the record.
+        try:
+            from .report import build_report
+
+            filename = (
+                f"reports/{origin_airport.icao}_{dest_airport.icao}_"
+                f"{profile.key}.html"
+            ).lower()
+
+            procedures, figures, checklist_text = [], {}, ""
+            try:
+                retrieved = find_procedures(
+                    aircraft=profile.key,
+                    phase="preflight",
+                    origin=origin_airport.icao,
+                    dest=dest_airport.icao,
+                )
+                if "error" not in retrieved:
+                    procedures = retrieved["procedures"]
+                    figures = retrieved.get("figures", {})
+                    # Quoted, not summarised: there is no model in this
+                    # path, and phrasing them here would be the invention
+                    # the whole design forbids.
+                    checklist_text = "\n".join(
+                        f"- {item['text'].strip().split('. ')[0]} [{item['id']}]"
+                        for item in procedures
+                    )
+            except Exception:  # noqa: BLE001 - the checklist is optional
+                pass
+
+            written = build_report(
+                plan,
+                checklist_text=checklist_text,
+                procedures=procedures,
+                figures=figures,
+            ).write(
+                filename,
+                airspace=airspace_index.volumes if airspace_index else None,
+            )
+            result["report_file"] = written["html"]
+            result["report_note"] = (
+                f"Full dispatch report written to {written['html']} -- route, "
+                "map, figures and a cited checklist. Give the user the path."
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed report keeps the plan
+            result["report_error"] = f"Route planned, but the report failed: {exc}"
+
     # Time, fuel and range are always reported. With wind applied they
     # come from the search itself, since cost IS time there. Without it,
     # they fall back to still-air arithmetic -- distance over true
@@ -854,7 +919,21 @@ def plan_flight(
                 f"Too short to reach the planned cruise level -- the flight "
                 f"tops out around {phases.cruise_altitude_ft:,.0f} ft."
             )
-        result["ete_note"] = (
+        # NO CHECKLIST REMINDER HERE ANY MORE. There was one, added
+        # after the model planned a route and then wrote eight checklist
+        # items from memory. It worked -- find_procedures is now called
+        # reliably -- and then it leaked, printed to the user as a
+        # footnote beneath a checklist, saying "this plan contains no
+        # checklist". Correct when plan_flight returned, stale by the
+        # time the model wrote its reply.
+        #
+        # It is gone rather than reworded because what it was patching is
+        # fixed twice over: the system prompt states the rule
+        # unconditionally, and report.py refuses to render an uncited
+        # item regardless of what the model does. An instruction that
+        # only might be obeyed is not worth the risk of it being read
+        # aloud.
+        result["_ete_note"] = (
             "Report the time as written in `ete_spoken`; do not reformat "
             "`ete`. ETE is airborne time from takeoff to landing and "
             "excludes taxi, so it reads lower than a published schedule."
@@ -873,30 +952,17 @@ def plan_flight(
         # trip people genuinely make. What makes the Atlantic different
         # is that the legs are over open water, so the advice cannot be
         # followed -- and the oceanic waypoints already tell us that.
-        stops = math.ceil(hours_en_route / endurance) - 1
-        if plan.grid_waypoints_used:
-            result["range_warning"] = (
-                f"The {profile.name} cannot fly this route. Flight time is "
-                f"{_spoken_duration(whole_hours, minutes)} against "
-                f"{endurance:.1f} h of "
-                f"endurance, and the route crosses open water where there is "
-                "nowhere to refuel. Say plainly that this is the wrong "
-                "aircraft for the trip, and suggest planning again with a "
-                "type that has the range."
-            )
-        else:
-            result["range_warning"] = (
-                f"Flight time of {_spoken_duration(whole_hours, minutes)} "
-                f"exceeds the "
-                f"{profile.name}'s {endurance:.1f} h endurance. About "
-                f"{stops} fuel stop{'s' if stops != 1 else ''} would be needed "
-                "-- tell the user this plainly."
-            )
+        # Delegated to the plan, so the report and the tool cannot
+        # disagree. They did: the report told a reader that a Cessna
+        # crossing the Atlantic needed "a fuel stop".
+        warning = plan.range_warning(payload)
+        if warning:
+            result["range_warning"] = warning
 
     if aircraft_defaulted:
         result["aircraft_note"] = (
             f"No aircraft was specified, so this was planned for a "
-            f"{profile.name}. Tell the user which aircraft was assumed."
+            f"{profile.name}."
         )
 
     return result
@@ -1160,6 +1226,275 @@ def check_airspace(
 # Registry
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# CP5: retrieval
+# ---------------------------------------------------------------------------
+
+PHASES = ("preflight", "departure", "cruise", "arrival", "emergency")
+
+# What counts as a water crossing, for selecting oceanic procedures.
+# Both thresholds must be met -- see `_flight_conditions` for the
+# measurements they come from.
+MIN_OCEANIC_GRID_POINTS = 20
+MIN_OCEANIC_GRID_FRACTION = 0.05
+
+
+def _procedure_index():
+    """The embedded corpus, built once and kept.
+
+    Loaded lazily like the airport data: embedding fifteen documents
+    costs a second, and a conversation that never asks for a checklist
+    should not pay it.
+    """
+    if "procedures" not in _CACHE:
+        from .retrieval import ProcedureIndex
+
+        _CACHE["procedures"] = ProcedureIndex.build()
+    return _CACHE["procedures"]
+
+
+def _flight_conditions(profile, origin_airport, dest_airport) -> List[str]:
+    """Which preconditions this flight is known to satisfy.
+
+    A document that declares `applies_when` is excluded unless its
+    condition appears here -- see `ProcedureIndex.search` for why
+    similarity alone was not enough.
+
+    KNOWN, NOT ASSUMED. Only conditions derivable from real data are
+    listed. Time of day is absent because nothing in the system records
+    it, so `night` is never satisfied and night procedures stay out
+    unless a caller supplies the condition explicitly. That is the right
+    default: a checklist item that does not apply is noise a pilot has to
+    filter, and the filtering is what a checklist exists to avoid.
+    """
+    conditions: List[str] = []
+
+    if profile.cruise_altitude_ft >= 25000:
+        conditions.append("high-altitude")
+
+    if origin_airport is not None and dest_airport is not None:
+        elevation = max(
+            origin_airport.elevation_ft or 0, dest_airport.elevation_ft or 0
+        )
+        if elevation >= 4000:
+            conditions += ["high-elevation", "mountainous"]
+
+        # OPEN WATER, MEASURED RATHER THAN GUESSED. The routing grid
+        # generates a waypoint wherever no navaid reaches, so a large
+        # number of generated points means a large gap in ground-based
+        # coverage -- which over the planet means water.
+        #
+        # A single generated point does not: navaid coverage has small
+        # holes over land too. The first version of this test asked
+        # merely whether ANY grid point existed and duly declared a
+        # flight across Wisconsin to be oceanic. Measured:
+        #
+        #     KPWK-KMSP     2 grid points   1% of candidates
+        #     KDEN-KMCI     6               3%
+        #     KJFK-KLAX    13               1%
+        #     KJFK-EGLL    62               8%
+        #     LPPT-TNCM    90              45%
+        #
+        # Land routes sit at or below 13 and 3%; genuine crossings start
+        # at 62 and 8%. Both tests must pass, so neither a long domestic
+        # route nor a short hop over a coastal gap qualifies.
+        try:
+            candidates = waypoints_for_route(
+                origin_airport.lat, origin_airport.lon,
+                dest_airport.lat, dest_airport.lon,
+                navaids_near_route(
+                    _navaids(),
+                    origin_airport.lat, origin_airport.lon,
+                    dest_airport.lat, dest_airport.lon,
+                    margin_nm=100.0,
+                ),
+                use_grid=True,
+            )
+            generated = count_grid_points(candidates)
+            if (
+                generated >= MIN_OCEANIC_GRID_POINTS
+                and generated >= MIN_OCEANIC_GRID_FRACTION * len(candidates)
+            ):
+                conditions.append("overwater")
+        except Exception:  # noqa: BLE001 - a hint, never a failure
+            pass
+
+    return conditions
+
+
+def _checklist_query(profile, origin_airport, dest_airport, phase: str) -> str:
+    """Turn a flight into the text that gets embedded.
+
+    THE QUERY IS BUILT FROM FACTS, NOT FROM THE USER'S WORDS. The model
+    could be asked to describe the flight and that description embedded,
+    but then retrieval would depend on how well it phrased things, and a
+    forgotten detail would silently drop a relevant procedure. Everything
+    below comes from the aircraft profile and the airport records.
+
+    Each clause selects a different part of the corpus: a turbine at
+    39,000 ft wants the high-altitude and oceanic material, a piston
+    single wants engine failure and density altitude.
+    """
+    terms = [phase, profile.name, profile.category]
+
+    if profile.category == "ga":
+        terms += ["light aircraft", "single engine piston", "visual flight"]
+    else:
+        terms += ["turbine", "pressurised", "airline operations"]
+
+    if profile.cruise_altitude_ft >= 25000:
+        terms += ["high altitude", "oxygen", "pressurisation", "jet stream"]
+
+    if origin_airport is not None and dest_airport is not None:
+        elevation = max(
+            origin_airport.elevation_ft or 0, dest_airport.elevation_ft or 0
+        )
+        if elevation >= 4000:
+            terms += ["high elevation airfield", "density altitude", "mountain"]
+
+        if haversine_nm(
+            origin_airport.lat, origin_airport.lon,
+            dest_airport.lat, dest_airport.lon,
+        ) > 1000:
+            terms += ["long range", "diversion", "alternate planning", "oceanic"]
+
+    return " ".join(terms)
+
+
+def _flight_figures(profile, origin_airport, dest_airport) -> Dict[str, Any]:
+    """Computed numbers a procedure can be anchored to.
+
+    WHY THIS EXISTS. Retrieval selects text; it does not write it. So
+    `fuel-reserves` reads identically whether the flight is a Cessna hop
+    across Illinois or a 777 to Newark:
+
+        "Compute what the flight requires, add the reserve, and only
+         then ask whether the aircraft can carry it."
+
+    True, cited, and not about your flight. The document states the RULE;
+    what was missing is where THIS flight sits against it. Both halves
+    are grounded -- the rule in a procedure document, the numbers in the
+    aircraft profile and the airport records -- so anchoring one to the
+    other invents nothing:
+
+        "Carry 45 minutes of reserve [fuel-reserves]. That is 1,853 gal
+         for this aircraft, against 47,890 gal of capacity."
+
+    Derived from the profile and the airports rather than from a route
+    plan, so this stays cheap: building a mesh and running A* to write a
+    checklist would cost seconds and duplicate work `plan_flight`
+    already did.
+    """
+    figures: Dict[str, Any] = {
+        "usable_fuel_gal": round(profile.usable_fuel_gal),
+        "reserve_gal": round(profile.reserve_gal),
+        "reserve_minutes": round(profile.reserve_minutes),
+        "endurance_hours": round(profile.endurance_hours(), 1),
+        "still_air_range_nm": round(profile.range_nm()),
+        "useful_load_lb": round(profile.useful_load_lb),
+        "typical_payload_lb": round(profile.typical_payload_lb),
+        "max_fuel_with_typical_payload_gal": round(profile.max_fuel_gal()),
+        "cruise_altitude_ft": round(profile.cruise_altitude_ft),
+        "service_ceiling_ft": round(profile.service_ceiling_ft),
+    }
+
+    if origin_airport is not None and dest_airport is not None:
+        figures["direct_distance_nm"] = round(
+            haversine_nm(
+                origin_airport.lat, origin_airport.lon,
+                dest_airport.lat, dest_airport.lon,
+            ),
+            1,
+        )
+        figures["origin_elevation_ft"] = round(origin_airport.elevation_ft or 0)
+        figures["destination_elevation_ft"] = round(dest_airport.elevation_ft or 0)
+
+    return figures
+
+
+def find_procedures(
+    aircraft: str,
+    phase: str = "preflight",
+    origin: Optional[str] = None,
+    dest: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retrieve procedure documents relevant to a flight.
+
+    RETURNS SOURCE MATERIAL, NOT A CHECKLIST. The model writes the
+    checklist; this decides what it is allowed to write from. That split
+    is the point: a model asked for a Cessna 172 checklist unaided
+    produces confident, plausible, invented procedures, which is the
+    failure this whole project is built against.
+    """
+    try:
+        profile = get_aircraft(aircraft)
+    except KeyError:
+        return {"error": f"Unknown aircraft {aircraft!r}.",
+                "hint": "Use list_aircraft to see valid keys."}
+
+    if phase not in PHASES:
+        return {"error": f"Unknown phase {phase!r}.", "valid_phases": list(PHASES)}
+
+    airports = _airports()
+    origin_airport = airports.get((origin or "").strip().upper())
+    dest_airport = airports.get((dest or "").strip().upper())
+
+    query = _checklist_query(profile, origin_airport, dest_airport, phase)
+    conditions = _flight_conditions(profile, origin_airport, dest_airport)
+
+    try:
+        from .retrieval import embed_texts
+
+        index = _procedure_index()
+        query_vector = embed_texts([query])[0]
+        matches = index.search(query_vector, conditions=conditions)
+    except Exception as exc:  # noqa: BLE001 - see dispatch()'s docstring
+        return {"error": f"Could not search procedures: {_short_error(exc)}"}
+
+    if not matches:
+        return {
+            "query": query,
+            "procedures": [],
+            "note": (
+                "No procedure in the corpus is relevant to this flight. Say so "
+                "rather than writing a checklist from general knowledge."
+            ),
+        }
+
+    return {
+        "aircraft": profile.name,
+        "phase": phase,
+        "query": query,
+        "conditions": conditions,
+        "figures": _flight_figures(profile, origin_airport, dest_airport),
+        "procedures": [
+            {
+                "id": match.chunk.id,
+                "title": match.chunk.title,
+                "category": match.chunk.category,
+                "text": match.chunk.text,
+                "relevance": round(match.score, 3),
+            }
+            for match in matches
+        ],
+        "note": (
+            "Write the checklist using ONLY these procedures. Cite the `id` of "
+            "the procedure each item came from, like [fuel-reserves]; an item "
+            "you cannot cite is an item you must not write. If the user asked "
+            "about a specific situation these procedures do not address, say "
+            "so in your FIRST sentence before offering related material -- do "
+            "not relabel general emergency procedures as advice about their "
+            "situation. If something a pilot would want is missing, say it is "
+            "not covered rather than supplying it from memory. Where a "
+            "procedure states a rule that `figures` can be measured "
+            "against, give the number: the document says what the rule "
+            "is, the figure says where this flight sits against it. Use "
+            "ONLY the numbers in `figures` -- do not compute or estimate "
+            "others."
+        ),
+    }
+
+
 TOOLS: List[ToolSpec] = [
     ToolSpec(
         name="find_airport",
@@ -1296,6 +1631,16 @@ TOOLS: List[ToolSpec] = [
                 "description": "Payload in pounds. Defaults to typical occupancy for the aircraft.",
                 "required": False,
             },
+            "save_report": {
+                "type": "boolean",
+                "description": (
+                    "Write a full dispatch report as HTML and JSON -- route, "
+                    "map, figures and a cited preflight checklist. Set true "
+                    "when the user asks for a report, a briefing document, or "
+                    "something they can open or share."
+                ),
+                "required": False,
+            },
             "save_map": {
                 "type": "boolean",
                 "description": (
@@ -1356,6 +1701,47 @@ TOOLS: List[ToolSpec] = [
             },
         },
         func=check_airspace,
+    ),
+    ToolSpec(
+        name="find_procedures",
+        description=(
+            "Retrieve real aviation procedure documents relevant to a flight. "
+            "Call this whenever the user asks for a checklist, briefing, or "
+            "what to consider or watch out for on a flight. It returns source "
+            "material, not a finished checklist -- write the checklist from "
+            "what it returns and cite the id of each procedure you use. Never "
+            "add items from your own knowledge: an invented procedure in a "
+            "checklist is exactly what this tool exists to prevent."
+        ),
+        parameters={
+            "aircraft": {
+                "type": "string",
+                "description": (
+                    "Which aircraft the checklist is for. Common keys: "
+                    "c172 (Cessna 172), sr22 (Cirrus SR22), b350 (King Air), "
+                    "b738 (Boeing 737-800), b789 (Boeing 787-9)."
+                ),
+                "enum": sorted(AIRCRAFT),
+                "required": True,
+            },
+            "phase": {
+                "type": "string",
+                "description": "Phase of flight the checklist covers.",
+                "enum": list(PHASES),
+                "required": False,
+            },
+            "origin": {
+                "type": "string",
+                "description": "Origin ICAO code, if known. Sharpens the retrieval.",
+                "required": False,
+            },
+            "dest": {
+                "type": "string",
+                "description": "Destination ICAO code, if known.",
+                "required": False,
+            },
+        },
+        func=find_procedures,
     ),
 ]
 

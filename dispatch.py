@@ -194,7 +194,12 @@ def format_arguments(call: ToolCall) -> str:
     `use_wind=True avoid_airspace=True save_map=False` on every call is
     noise; only non-default values are interesting.
     """
-    hidden = {"use_wind": True, "avoid_airspace": True, "save_map": False}
+    hidden = {
+        "use_wind": True,
+        "avoid_airspace": True,
+        "save_map": False,
+        "save_report": False,
+    }
     parts = [
         f"{key}={value!r}"
         for key, value in call.arguments.items()
@@ -211,6 +216,8 @@ def summarise_result(result: ToolResult) -> str:
         return red(f"error: {content['error']}")
 
     if result.name == "plan_flight":
+        if content.get("report_file"):
+            return f"{content.get('route', '')}  ->  {content['report_file']}"
         pieces = [content.get("route", "")]
         if "route_distance_nm" in content:
             pieces.append(f"{content['route_distance_nm']} nm")
@@ -236,6 +243,15 @@ def summarise_result(result: ToolResult) -> str:
             f"{content.get('active_volumes_in_region', 0)} active, "
             f"{len(crossings)} on the direct course"
         )
+
+    if result.name == "find_procedures":
+        procedures = content.get("procedures", [])
+        if not procedures:
+            return "no applicable procedures"
+        names = ", ".join(item["id"] for item in procedures)
+        conditions = content.get("conditions") or []
+        line = f"{len(procedures)} procedures: {names}"
+        return line + (f"  [{', '.join(conditions)}]" if conditions else "")
 
     if result.name == "get_winds_aloft":
         return (

@@ -100,6 +100,52 @@ class RoutePlan:
             return None
         return self.total_distance_nm / self.ete_hours
 
+    def range_warning(self, payload_lb: Optional[float] = None) -> Optional[str]:
+        """Why this aircraft cannot make this flight, or None if it can.
+
+        ONE SOURCE OF TRUTH, BECAUSE THERE WERE TWO AND THEY DISAGREED.
+        `plan_flight` distinguished a shortfall that a fuel stop solves
+        from one it does not -- a Cessna crossing the United States needs
+        four stops and that is a trip people make; over the Atlantic
+        there is nowhere to stop. The report reimplemented the check and
+        got it wrong, telling a reader that a KJFK-EGLL flight in a 172
+        needed "a fuel stop" over an ocean with no airfields.
+
+        The discriminator is the oceanic waypoints: the routing grid
+        generates them only where no navaid reaches, which over the
+        planet means water.
+        """
+        import math
+
+        if self.aircraft is None or self.ete_hours is None:
+            return None
+
+        endurance = self.aircraft.endurance_hours(payload_lb)
+        if endurance <= 0 or self.ete_hours <= endurance:
+            return None
+
+        hours = int(self.ete_hours)
+        minutes = int(round((self.ete_hours - hours) * 60))
+        spoken = f"{hours} hour{'s' if hours != 1 else ''}"
+        if minutes:
+            spoken += f" {minutes} minute{'s' if minutes != 1 else ''}"
+
+        if self.grid_waypoints_used:
+            return (
+                f"The {self.aircraft.name} cannot fly this route. Flight time "
+                f"is {spoken} against {endurance:.1f} h of endurance, and the "
+                "route crosses open water where there is nowhere to refuel. "
+                "This is the wrong aircraft for the trip; one with the range "
+                "is needed."
+            )
+
+        stops = math.ceil(self.ete_hours / endurance) - 1
+        return (
+            f"Flight time of {spoken} exceeds the {self.aircraft.name}'s "
+            f"{endurance:.1f} h endurance. About {stops} fuel "
+            f"stop{'s' if stops != 1 else ''} would be needed."
+        )
+
     def is_within_range(self, payload_lb: Optional[float] = None) -> Optional[bool]:
         """Whether the aircraft can actually make this flight.
 

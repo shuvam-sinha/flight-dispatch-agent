@@ -971,3 +971,160 @@ class TestArgumentCoercion(unittest.TestCase):
                 {"latitude": 39.86, "longitude": -104.67, "altitude_ft": "34000"},
             )
         self.assertEqual(result["altitude_ft"], 34000.0)
+
+
+class TestFactsAndInstructionsAreSeparate(unittest.TestCase):
+    """A result field is either a fact for the user or an instruction to
+    the model, and never both.
+
+    THE LEAK THIS ADDRESSES. `checklist_note` was printed to the user as
+    a footnote beneath a checklist, reading "this plan contains no
+    checklist" -- correct when plan_flight returned, stale by the time
+    the model replied. It was already named `*_note`, which had been the
+    convention for things the model would not quote. One sample, and it
+    was wrong: naming lowers the chance of a leak, it does not prevent
+    one.
+
+    So instructions are few, prefixed with an underscore, and the system
+    prompt says never to quote them. Everything else in a result is a
+    fact that the user is welcome to see.
+    """
+
+    # Phrases that are unambiguously directed AT THE READER. A looser
+    # list flagged "navaids do not cover open water", which is a
+    # description rather than an order -- the distinction the whole rule
+    # turns on.
+    INSTRUCTION_WORDS = (
+        "report the route",
+        "report the time",
+        "do not reformat",
+        "do not write",
+        "do not quote",
+        "never quote",
+        "tell the user",
+        "offer the map",
+        "say plainly",
+    )
+
+    def plan(self, **kwargs):
+        arguments = {
+            "origin": "KJFK",
+            "dest": "EGLL",
+            "aircraft": "c172",
+            "use_wind": False,
+        }
+        arguments.update(kwargs)
+        return dispatch("plan_flight", arguments)
+
+    def test_instruction_fields_are_underscored(self):
+        for field, value in self.plan().items():
+            if isinstance(value, str) and any(
+                word in value.lower() for word in self.INSTRUCTION_WORDS
+            ):
+                with self.subTest(field):
+                    self.assertTrue(
+                        field.startswith("_"),
+                        f"{field} instructs the model but is not underscored",
+                    )
+
+    def test_user_facing_fields_carry_no_instruction(self):
+        # A safety warning the user must see cannot also be telling the
+        # model what to do, or it becomes unquotable.
+        result = self.plan()
+        for field in ("wind", "restricted_airspace", "range_warning", "aircraft_note"):
+            if field in result:
+                with self.subTest(field):
+                    self.assertFalse(
+                        any(
+                            word in result[field].lower()
+                            for word in self.INSTRUCTION_WORDS
+                        ),
+                        f"{field} is shown to the user but contains an instruction",
+                    )
+
+    def test_the_range_warning_is_still_a_warning(self):
+        # Stripping the instruction must not strip the substance.
+        warning = self.plan()["range_warning"]
+        self.assertIn("cannot fly this route", warning)
+        self.assertIn("nowhere to refuel", warning)
+
+    def test_the_defaulted_aircraft_is_still_reported(self):
+        note = self.plan(aircraft=None).get("aircraft_note", "")
+        self.assertIn("No aircraft was specified", note)
+
+    def test_the_stale_checklist_note_is_gone(self):
+        # It leaked, and what it patched is fixed twice over: the system
+        # prompt states the rule, and the report refuses uncited items.
+        self.assertNotIn("checklist_note", self.plan())
+
+    def test_the_prompt_explains_the_underscore_convention(self):
+        from flight_dispatch.agent import DEFAULT_SYSTEM_PROMPT
+
+        self.assertIn("underscore", DEFAULT_SYSTEM_PROMPT)
+        self.assertIn("never quote", DEFAULT_SYSTEM_PROMPT.lower())
+
+
+class TestSaveReport(unittest.TestCase):
+    """The report is the artefact; the model's summary is a convenience.
+
+    The model summarises selectively -- a range warning became "a warning
+    has been issued", airspace was dropped from a reply entirely. The
+    report renders every field in full and refuses to include a checklist
+    item that cites nothing.
+    """
+
+    def plan(self, **kwargs):
+        arguments = {
+            "origin": "KPWK",
+            "dest": "KMSP",
+            "aircraft": "sr22",
+            "use_wind": False,
+        }
+        arguments.update(kwargs)
+        return dispatch("plan_flight", arguments)
+
+    def test_no_report_unless_asked(self):
+        self.assertNotIn("report_file", self.plan())
+
+    def test_a_report_is_written_and_its_path_returned(self):
+        from pathlib import Path
+
+        result = self.plan(save_report=True)
+        self.assertNotIn("report_error", result)
+        self.assertTrue(Path(result["report_file"]).is_file())
+        self.assertTrue(
+            Path(result["report_file"].replace(".html", ".json")).is_file()
+        )
+
+    def test_the_filename_identifies_the_flight(self):
+        path = self.plan(save_report=True)["report_file"]
+        self.assertIn("kpwk", path)
+        self.assertIn("kmsp", path)
+        self.assertIn("sr22", path)
+
+    def test_the_model_is_told_to_give_the_user_the_path(self):
+        # It cannot open the file itself, exactly as with the map.
+        self.assertIn("path", self.plan(save_report=True)["report_note"])
+
+    def test_the_report_carries_the_route(self):
+        import json
+        from pathlib import Path
+
+        result = self.plan(save_report=True)
+        data = json.loads(
+            Path(result["report_file"].replace(".html", ".json")).read_text()
+        )
+        self.assertEqual(data["route"], result["route"])
+
+    def test_the_parameter_reaches_both_backends(self):
+        # A boolean, so it survives Apple's schema as well as JSON Schema.
+        spec = TOOLS_BY_NAME["plan_flight"].parameters["save_report"]
+        self.assertEqual(spec["type"], "boolean")
+
+    def test_a_failed_report_does_not_lose_the_plan(self):
+        from unittest.mock import patch
+
+        with patch("flight_dispatch.report.build_report", side_effect=OSError("disk")):
+            result = self.plan(save_report=True)
+        self.assertIn("route", result)
+        self.assertIn("report_error", result)
