@@ -898,23 +898,12 @@ def plan_flight(
         # trip people genuinely make. What makes the Atlantic different
         # is that the legs are over open water, so the advice cannot be
         # followed -- and the oceanic waypoints already tell us that.
-        stops = math.ceil(hours_en_route / endurance) - 1
-        if plan.grid_waypoints_used:
-            result["range_warning"] = (
-                f"The {profile.name} cannot fly this route. Flight time is "
-                f"{_spoken_duration(whole_hours, minutes)} against "
-                f"{endurance:.1f} h of "
-                f"endurance, and the route crosses open water where there is "
-                "nowhere to refuel. This is the wrong aircraft for the trip; "
-                "one with the range is needed."
-            )
-        else:
-            result["range_warning"] = (
-                f"Flight time of {_spoken_duration(whole_hours, minutes)} "
-                f"exceeds the "
-                f"{profile.name}'s {endurance:.1f} h endurance. About "
-                f"{stops} fuel stop{'s' if stops != 1 else ''} would be needed."
-            )
+        # Delegated to the plan, so the report and the tool cannot
+        # disagree. They did: the report told a reader that a Cessna
+        # crossing the Atlantic needed "a fuel stop".
+        warning = plan.range_warning(payload)
+        if warning:
+            result["range_warning"] = warning
 
     if aircraft_defaulted:
         result["aircraft_note"] = (

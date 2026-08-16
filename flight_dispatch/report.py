@@ -150,6 +150,10 @@ class DispatchReport:
                 "reached_planned_altitude": phases.reached_planned_altitude,
             }
 
+        warning = plan.range_warning()
+        if warning:
+            report["range_warning"] = warning
+
         if plan.airspace_avoided is not None:
             report["restricted_airspace_avoided"] = plan.airspace_avoided
 
@@ -431,10 +435,13 @@ def _render_html(data: Dict[str, Any], map_html: str) -> str:
         f'<div class="route">{html.escape(data["route"])}</div>',
     ]
 
-    if data.get("within_aircraft_range") is False:
+    # The plan's own words, not a second implementation of the same
+    # judgement. The reimplementation said "a fuel stop is required" for
+    # a Cessna crossing the Atlantic, where there is nowhere to stop.
+    if data.get("range_warning"):
         sections.append(
-            '<h2>Range</h2><div class="warn">This route exceeds the '
-            "aircraft's endurance. A fuel stop is required.</div>"
+            f'<h2>Range</h2><div class="warn">'
+            f"{html.escape(data['range_warning'])}</div>"
         )
 
     if map_html:

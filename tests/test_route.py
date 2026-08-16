@@ -184,3 +184,86 @@ class TestPlanRouteAStar(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRangeWarning(unittest.TestCase):
+    """ONE SOURCE OF TRUTH, BECAUSE THERE WERE TWO AND THEY DISAGREED.
+
+    `plan_flight` distinguished a shortfall a fuel stop solves from one
+    it does not: a Cessna crossing the United States needs four stops and
+    that is a trip people make, while over the Atlantic there is nowhere
+    to stop. The report reimplemented the check and got it wrong, telling
+    a reader that KJFK to EGLL in a 172 needed "a fuel stop" over an
+    ocean with no airfields.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from flight_dispatch.data_loader import (
+            load_airports,
+            load_navaids,
+            navaids_near_route,
+        )
+
+        cls.airports = load_airports()
+        cls.navaids = load_navaids()
+        cls._navaids_near_route = staticmethod(navaids_near_route)
+
+    def plan(self, origin_icao, dest_icao, aircraft_key):
+        from flight_dispatch.aircraft import get_aircraft
+        from flight_dispatch.data_loader import navaids_near_route
+        from flight_dispatch.route import plan_route
+
+        origin = self.airports[origin_icao]
+        dest = self.airports[dest_icao]
+        near = navaids_near_route(
+            self.navaids, origin.lat, origin.lon, dest.lat, dest.lon, margin_nm=100
+        )
+        return plan_route(
+            origin, dest, near, aircraft=get_aircraft(aircraft_key), use_grid=True
+        )
+
+    def test_a_flight_within_range_has_no_warning(self):
+        self.assertIsNone(self.plan("KPWK", "KMSP", "sr22").range_warning())
+
+    def test_an_overland_shortfall_suggests_fuel_stops(self):
+        warning = self.plan("KJFK", "KLAX", "c172").range_warning()
+        self.assertIn("fuel stop", warning)
+        self.assertNotIn("cannot fly", warning)
+
+    def test_an_oceanic_shortfall_says_it_cannot_be_flown(self):
+        warning = self.plan("KJFK", "EGLL", "c172").range_warning()
+        self.assertIn("cannot fly this route", warning)
+        self.assertIn("nowhere to refuel", warning)
+        self.assertNotIn("fuel stop", warning)
+
+    def test_a_plan_without_an_aircraft_has_no_warning(self):
+        from flight_dispatch.data_loader import navaids_near_route
+        from flight_dispatch.route import plan_route
+
+        origin = self.airports["KPWK"]
+        dest = self.airports["KMSP"]
+        near = navaids_near_route(
+            self.navaids, origin.lat, origin.lon, dest.lat, dest.lon, margin_nm=100
+        )
+        self.assertIsNone(plan_route(origin, dest, near).range_warning())
+
+    def test_the_tool_and_the_report_say_the_same_thing(self):
+        # The bug this closes: two implementations of one judgement.
+        from flight_dispatch.report import build_report
+        from flight_dispatch.tools import dispatch
+
+        plan = self.plan("KJFK", "EGLL", "c172")
+        report = build_report(plan).to_dict()
+        result = dispatch(
+            "plan_flight",
+            {"origin": "KJFK", "dest": "EGLL", "aircraft": "c172", "use_wind": False},
+        )
+        self.assertEqual(report["range_warning"], result["range_warning"])
+
+    def test_the_report_renders_the_plans_own_words(self):
+        from flight_dispatch.report import build_report
+
+        page = build_report(self.plan("KJFK", "EGLL", "c172")).to_html()
+        self.assertIn("nowhere to refuel", page)
+        self.assertNotIn("A fuel stop is required", page)
