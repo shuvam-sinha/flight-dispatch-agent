@@ -196,17 +196,49 @@ Wind is sampled per leg and per segment within a leg, with the course
 recomputed each time: a 150 nm edge can start in a headwind and end in a
 crosswind, and on a great circle the heading changes continuously.
 
-### Airspace, for free
+### Airspace avoidance, without an avoidance algorithm
 
-780 blocking FAA volumes, indexed with an STRtree. An edge crossing prohibited
-airspace costs `math.inf`, and A\* routes around it — no avoidance algorithm
-required, which is what the `cost_function` hook was for. Altitude bands are
-respected: 501 volumes are active at 8,000 ft, 235 at 41,000 ft.
+There is no code anywhere that steers a route around a restricted area. The
+behaviour falls out of the cost function.
+
+780 FAA volumes are loaded as polygons and indexed with an STRtree, so asking
+"does this leg cross anything" is a bounding-box lookup rather than 780
+intersection tests. Volumes are filtered by altitude first: 501 are active at
+8,000 ft and 235 at 41,000 ft, so a jet is not routed around a range that tops
+out at 12,000.
+
+Then one line does the work:
+
+```python
+if index.blocks(a.lat, a.lon, b.lat, b.lon):
+    return math.inf
+```
+
+An edge crossing prohibited airspace costs infinity. A\* skips any edge whose
+cost is not finite, so such a leg is never added to the frontier and can never
+appear in a result. The search does not know what airspace *is* — it knows some
+edges are unaffordable, and it was already built to prefer cheap ones.
+
+The airspace cost **wraps** the wind cost rather than replacing it:
+
+```
+distance  →  time (wind)  →  math.inf if blocked
+```
+
+so the answer is the *fastest* route that is also legal, not merely a legal one.
+
+That is what the `cost_function` hook existed for. Adding airspace avoidance
+required no change to `search.py` at all — which is the same property that let
+the agent be added later without touching the router.
 
 ```
 KLAX→KSLC   unrestricted   crosses 9 restricted areas    515.8 nm
             avoiding       crosses 0                     536.6 nm
 ```
+
+Verified leg by leg rather than by trusting the count: every segment of the
+avoiding route was re-tested against the index, and none intersects a blocking
+volume.
 
 ### Aircraft
 
@@ -298,6 +330,52 @@ rather than being dropped: a silently cleaned report would look fully grounded
 while the model had been inventing.
 
 ## Design notes
+
+### Why A\*, and not something else
+
+The problem is a shortest path through a weighted graph with no negative
+weights, which narrows the field quickly.
+
+**Breadth-first search** finds the fewest *edges*, not the shortest distance —
+it would happily return a three-hop route that is 400 nm longer than a
+four-hop one. **Depth-first** does not find shortest paths at all.
+
+**Bellman-Ford** handles negative edge weights, which cannot occur here: a leg
+cannot have negative length, and with wind it cannot have negative time either,
+because a headwind stronger than the aircraft's TAS makes the leg impossible
+rather than instantaneous. Paying `O(VE)` for a capability the problem cannot
+use is a poor trade.
+
+**Floyd-Warshall** computes every pair of shortest paths. One route is needed,
+and the graph is rebuilt per request, so this is the wrong problem in the wrong
+shape.
+
+**Greedy best-first** is fast and wrong: it follows the heuristic alone and
+returns the first path it stumbles into, with no guarantee it is the shortest.
+
+That leaves **Dijkstra**, which is correct, and **A\***, which is Dijkstra plus
+an estimate of the distance still to go. The estimate is what makes it worth
+choosing here, and this problem hands one over for free: the great-circle
+distance from any waypoint to the destination. It is **admissible** by
+construction — no route between two points can be shorter than the straight line
+between them — so A\* returns exactly the path Dijkstra would, having looked at
+far less of the graph.
+
+```
+KPWK→KMSP    Dijkstra expanded 216 nodes    A* expanded 3    identical route
+```
+
+Admissibility is the whole argument. A heuristic that overestimates makes A\*
+fast and wrong; one that never overestimates makes it fast and provably optimal.
+When the cost became time rather than distance, the heuristic had to be
+rewritten to stay admissible — nautical miles are not a lower bound on hours —
+which is why `a_star` takes a `distance_to_cost` converter rather than assuming
+the units.
+
+Written by hand rather than imported from `networkx`, for the same reason the
+agent loop is: the algorithm is the thing worth demonstrating. It is about 90
+lines over `heapq`, and it was verified against exhaustive brute-force search on
+400 random graphs and against Dijkstra on real routes.
 
 ### Why the mesh radius is 150 nm
 
@@ -497,234 +575,87 @@ unchanged.
 
 ## Bugs worth recording
 
-Most of these came from running the assistant conversationally rather than from
-a test. Agents fail in ways unit tests do not reach, and nearly every entry
-below was found by reading a real transcript.
+**All of these are fixed** — open limitations are in Scope below. They are here
+because the reasoning was worth keeping, and because most were found by using
+the thing rather than by testing it. Agents fail in ways unit tests do not
+reach.
 
 **Along-track distance was unsigned.** The textbook `acos` form returns 0–π, so
-a navaid *behind* the aircraft reported positive forward progress, and the
-early corridor sampler happily selected waypoints in the wrong direction. Fixed by
-recovering the sign from `cos(θ₁₃ − θ₁₂)`.
+a navaid *behind* the aircraft reported positive forward progress and the early
+corridor sampler selected waypoints in the wrong direction. Fixed by recovering
+the sign from `cos(θ₁₃ − θ₁₂)`.
 
-**The bounding box missed the great-circle bulge.** Sampling only the endpoints
-cut 1.35° off KJFK→EGLL, silently discarding navaids the route needed.
-`route_bounding_box` now samples 32 points along the arc.
-
-**The antimeridian.** PANC→RJTT searched 293° of longitude instead of 77°,
-pulling 5,410 navaids instead of 182. Fixed with `unwrap_longitudes`.
+**The region was computed wrong, twice.** Sampling only the endpoints for a
+bounding box cut 1.35° off KJFK→EGLL, silently discarding navaids the route
+needed — a great circle bulges poleward between its ends. And PANC→RJTT searched
+293° of longitude instead of 77°, pulling 5,410 navaids instead of 182, because
+the box straddled the antimeridian. Both are now handled in `geo.py`, so nothing
+downstream has to think about them.
 
 **A connected graph is not the same as no isolated nodes.** The k-nearest floor
-guarantees every node has neighbours, which is not the same guarantee: KJFK→EGLL
-built 695 nodes of which only 350 were reachable, split into clusters by open
-water. `_bridge_components` joins them with a union-find pass.
+guarantees every node has neighbours, which sounds like the same guarantee and
+is not: KJFK→EGLL built 695 nodes of which only 350 were reachable, split into
+clusters by open water. `_bridge_components` joins them with a union-find pass.
 
-**The model invented a payload.** Apple's schema format has no optional fields,
-so "(optional)" written in prose was invisible — the model supplied
-`payload_lb: 1600` for a Cessna 172, exceeding its 870 lb useful load, and both
-plans were correctly refused for a reason the user never asked for. Free
-numerics are now withheld from the schema entirely; only required fields, enums
-and booleans are exposed.
-
-**Withholding then broke aircraft selection**, because "in a Cirrus" could no
-longer reach the tool. Fixed by making `aircraft` an enum of all 47 keys, with
-model names inlined as hints (`sr22 (Cirrus SR22)`) for when the lean tool set
-drops `list_aircraft`.
-
-**Tool calls displayed against the wrong results.** A transcript showed
-"Minneapolis" printed above Chicago Executive's result. Apple's SDK runs tools
-concurrently; a shared counter plus a positional `zip` mispaired them. Fixed
-with an id per invocation and explicit pairing.
-
-**A 2,093-character URL inside one error message** consumed half the context
-window. `_short_error` now truncates at the URL boundary and caps at 180 chars.
-
-**`find_airport("San Francisco")` returned a Mexican airstrip** — and the agent
-planned a flight from it, which is the failure mode that matters: a wrong answer
-delivered fluently. Matches had been sorted by name length. Ranking now uses
-real significance signals: airport type, scheduled service, IATA code,
-municipality match, then longest runway (which meant finally opening the
-`runways.csv` that had been sitting unopened in the data directory since the
-first day).
-
-**The size tiebreaker measured the wrong thing.** Among airports tied on type,
-scheduled service, IATA code and city, longest-single-runway decided — and it
-loses to anywhere that built one long strip and little else. Dubai
-International, ~90 million passengers a year, ranked below Al Maktoum, which is
-nearly empty with a runway 174 ft longer. Tokyo Haneda lost to Narita the same
-way. Total runway area — every runway, times its width, excluding closed ones —
-tracks how much traffic an airport can handle. On fifteen multi-airport cities:
-longest runway 12 correct, total area 14.
-
-**Accents.** `_normalise` stripped punctuation but not diacritics, so
-`Sao Paulo` never matched Guarulhos' municipality `São Paulo` and fell through
-to a hotel helipad that spells it without one. NFKD decomposition splits an
-accented character into base letter plus combining mark; dropping the marks
-leaves the base letters. Zürich, Málaga and Köln were the same bug.
-
-**`keywords` was never read.** OurAirports keeps alternate names there —
-`Londres` for Heathrow, `Ciudad de México` for Benito Juárez, plus IATA
-metropolitan area codes (`LON`, `NYC`, `CHI`). Adding it to the search text
-costs nothing and makes local-language queries work.
-
-Across 45 major world cities the ranker now returns the expected airport 44
-times. The exception is **Mexico City**: Felipe Ángeles is a converted air force
-base with four runways and 8.9M sq ft of pavement against Benito Juárez's 3.8M —
-more concrete, almost no traffic. No runway-derived metric separates them and
-this dataset carries no passenger figures, so it is a documented miss with a
-test pinning the current behaviour. Naming the airport (`Benito Juarez`, `MEX`,
-`AICM`, `Ciudad de Mexico`) reaches it correctly.
-
-**`find_airport("New York JFK")` found nothing at all** — the phrase is a
-substring of no field, because the city and the code live in different columns.
-Fixing it exposed a family of related misses, and the search now tries, in
-order: exact ICAO, exact IATA, phrase, all-words-anywhere, best partial match,
-and finally a spacing-blind compare so `OHare` reaches `O'Hare`. Each pass
-*widens* rather than replaces, because phrase search can succeed on the wrong
-thing: "Los Angeles airport" is contained in "Hilton Los Angeles Airport
-Helipad" but not in "Los Angeles International Airport". All candidates go to
-the ranker, which knows a large airport outranks a helipad.
+**`find_airport` was wrong in five different ways.** It sorted by name length,
+so a Mexican airstrip literally named "San Francisco" outranked SFO — and the
+agent planned a flight from it. Ranking now uses real signals: airport type,
+scheduled service, IATA code, city match, then total runway area. That last one
+replaced longest-single-runway, which ranked Al Maktoum above Dubai
+International on a runway 174 ft longer at an airport with almost no traffic.
+Matching was wrong too: `New York JFK` matched nothing (city and code live in
+different columns), `Sao Paulo` matched nothing (accents), and `JFK` matched
+nothing (IATA codes aren't substrings of names). Across 45 major world cities
+the ranker now returns the expected airport 44 times.
 
 **The airspace result was narrated backwards.** The router avoided all 95
-restricted areas near a route — and the reply said *"Route includes prohibited
+restricted areas near a route, and the reply said *"Route includes prohibited
 and restricted airspace."* Every number was correct; the safety claim came out
-inverted. The cause was two fields the model had to assemble itself:
+inverted. The cause was two fields the model had to assemble itself —
+`airspace_avoidance_applied: true` and `restricted_volumes_considered: 95` —
+where "considered" reads equally well as *taken into account* and *included in*.
+It now returns one sentence that cannot be read the other way.
 
-```python
-"airspace_avoidance_applied": True
-"restricted_volumes_considered": 95
-```
+This generalised the founding rule. "The model never does computation" was not
+enough: `95` is a number reported faithfully, and *through* versus *around* is
+an interpretation built from it. **The model never derives anything.** No test
+caught this, because every test checked the router, and the router was never
+wrong.
 
-"Considered" reads equally well as *taken into account* and *included in*, and
-beside a count of 95 the second reading is the more natural one. The fix was to
-return the conclusion as a sentence — `"Routed clear of 95 active volumes. The
-route crosses none of them."` — which cannot be read the other way.
+**A schema constraint cascaded three times.** Apple's format cannot express an
+optional parameter, so every parameter offered gets filled — the model invented
+`payload_lb: 1600` for a Cessna 172, exceeding its 870 lb useful load, and both
+plans were refused for a reason nobody asked for. Withholding free numerics
+fixed that and broke aircraft selection, because "in a Cirrus" could no longer
+reach the tool; an enum of the 47 keys fixed that. Then the same reasoning
+applied to altitude left `get_winds_aloft` unable to be given one at all: asked
+for the wind at 35,000 ft it answered at its 8,000 ft default and labelled the
+answer 35,000. The rule that came out of it is narrower than any of the three
+attempts: **expose a parameter where it is the question, withhold it where the
+aircraft already knows the answer.**
 
-This generalised the project's founding rule. "The LLM never does computation"
-was not enough: `95` is a number the model reported faithfully, and *through*
-versus *around* is an interpretation built from the identical number. So the
-rule is now **the LLM never does computation, and never decides what a result
-means either.** Any field a reasonable reader could draw the opposite conclusion
-from should be a sentence, not a value.
+**A single flight plan could exhaust the weather API's quota.** Live winds
+failed on every long route for three sessions. Open-Meteo meters *work*, not
+requests — roughly locations × variables × days — and at a fixed 0.5° grid a
+transcontinental plan wanted ~1,936 units against a 600-per-minute allowance. No
+retry schedule could have helped. The cell count is now capped and the grid
+resolution follows, so short routes keep fine resolution and long ones coarsen.
 
-No test caught this, because every test checked the router, and the router was
-never wrong.
+**The model mistyped numbers it had to reformat.** `27N023W` became `27NN023W`
+in a 30-waypoint oceanic route; `1h01m` became "1 hour 4 minutes". In the same
+reply, distance, fuel, altitude and airspace count were all exact, and the
+`wind` and `restricted_airspace` sentences were copied verbatim. The compact
+token was the only thing the model had to *rewrite* rather than repeat. So the
+tool supplies the phrasing — `ete_spoken: "1 hour 1 minute"` — the same move as
+the compass point, which exists because 239° came back as "from the northeast".
 
-**An unspecified aircraft was filled in silently.** Asked to fly KJFK to EGLL
-with no type named, `plan_flight` defaulted to a Cessna 172 and returned a
-straight-faced plan: 22h15m and 195 gallons, in an aircraft holding 56. The
-default now reports itself, and the schema tells the model to omit the parameter
-rather than guess.
-
-The range warning was wrong in a subtler way: it said *"a fuel stop is
-required."* The discriminator turned out not to be how far short the aircraft
-falls — a 172 crossing the United States needs four stops, and that is a trip
-people genuinely make. What makes the Atlantic different is that there is
-nowhere to land, and the oceanic waypoints already record exactly that. Overland
-shortfalls suggest fuel stops; oceanic ones say the aircraft cannot fly the
-route.
-
-**A single flight plan could exhaust the API quota.** Live winds failed on every
-long route for three sessions running — precisely the flights where wind matters
-most. Open-Meteo meters *work*, not requests: roughly locations × variables ×
-days, against ~600 units per minute on the free tier. At a fixed 0.5° grid the
-cost scaled with route length:
-
-```
-route          0.5 deg      1.0 deg      2.0 deg
-KPWK-KMSP     168 cells     64 cells     26 cells
-KBOS-KDEN     562          244           92
-KJFK-KLAX     968          422          148
-```
-
-A transcontinental plan wanted ~1,936 units and exhausted the minute by itself,
-so no retry schedule could have helped. The cell count is now capped and the
-resolution follows, chosen once where the whole route is visible: short routes
-keep the fine grid, long ones coarsen. Measured on real meshes, all four test
-routes moved inside the budget where three had been outside it.
-
-Batches are also fetched concurrently — they are independent and the wait is
-entirely network — and retries distinguish limits that waiting clears from ones
-it cannot. An hourly or daily cap is no longer retried, and the error carries
-the server's own words, so "try again tomorrow" reaches the user instead of
-`HTTPError`.
-
-**Live winds were read at the wrong hour.** `forecast_hour=0` was documented as
-"roughly now." Open-Meteo's hourly series starts at 00:00 UTC of the current
-day, so index 0 is midnight — accurate at 00:30 UTC and twenty-three hours stale
-by late evening. The data was genuinely live, from the current model run; it was
-being read at the wrong point in it. The response carries its own timestamps, so
-the index is now looked up rather than assumed.
-
-**The wind altitude could not be asked for.** Asked for the wind at 35,000 ft
-over Denver, the agent answered *12 kt from 239°, 11.9°C* and called it the
-35,000 ft wind. The true value was **26 kt from 223°, −41°C**. The temperature
-gives it away — nothing at FL350 is ever +12°.
-
-The model was not being careless. `_is_exposed` withholds free numerics from
-Apple's schema, which was the fix for the invented `payload_lb: 1600`. The side
-effect was that `altitude_ft` could not be passed to `get_winds_aloft` **at
-all** — so it answered at its 8,000 ft default, truthfully, and the model
-attached the user's altitude to it. `altitude_ft` is now an enum of ten
-altitudes, which passes the filter the same way `aircraft` does, with values
-chosen to land on distinct pressure levels so no two options return identical
-data.
-
-The schema fix alone was not enough, because the altitude was **already** a
-field in the result and the model skipped it — a bare number beside other bare
-numbers is easy to skip. The wind result now names its own altitude in the same
-sentence as the wind:
-
-```
-At 34,000 ft: wind from 223 degrees true (southwest) at 26 kt, temperature -41C.
-```
-
-Same principle as the airspace fix: a result that states what it is cannot be
-relabelled. The compass point is there for a related reason — the model rendered
-239° as "from the northeast", which is the opposite side of the compass.
-
-**Then the same enum broke `plan_flight` within the hour.** Given *"plan a flight
-from KJFK to KLAX in a 737"*, the model volunteered `altitude_ft='30000'` — which
-nobody asked for, and a 737-800 cruises at 35,000. The follow-up *"what about in
-a 172?"* carried that 30,000 into an aircraft with a **14,000 ft service
-ceiling**, and the plan was refused outright. Before the enum existed, the model
-could not set the parameter and both flights planned fine.
-
-So the rule is narrower than "expose it": **expose an altitude where the altitude
-is the question, and withhold it where the aircraft already knows the answer.**
-Wind without an altitude is meaningless, so `get_winds_aloft` keeps its enum.
-An aircraft profile's own cruise altitude is better than anything the model will
-invent, so `plan_flight` goes back to withheld. `check_airspace` keeps the enum —
-altitude is a genuine query dimension there — but its result now names the
-altitude in the same sentence as the count, because a wrong altitude there fails
-*silently* rather than erroring.
-
-Worth noting what went right: the tool returned `"cannot cruise at 30,000 ft;
-its service ceiling is 14,000 ft"` as **data**, and the model explained the
-problem and offered alternatives instead of crashing. That is the errors-as-data
-design doing its job.
-
-**The model mistyped numbers it had to reformat.** Two cases, both from real
-transcripts. On a South Atlantic route the oceanic fix `27N023W` was written as
-`27NN023W`. On KSFO-KLAS an ETE of `1h01m` was reported as "1 hour 4 minutes".
-
-The pattern is sharp: in that same KSFO reply, distance, fuel, altitude, wind
-and airspace count were all exact, and the `wind` and `restricted_airspace`
-sentences were copied word for word. The compact token `1h01m` was the only
-thing the model had to *rewrite* rather than repeat -- and rewriting is where
-the error entered.
-
-So the tool supplies the phrasing rather than leaving it to be derived:
-`ete_spoken: "1 hour 1 minute"` alongside the compact `ete`. Same move as the
-compass point, which exists because 239 degrees came back as "from the
-northeast". The remaining error surface here is narrow and worth naming
-precisely: the model is no longer inventing facts, it is making typos.
-
-**A wind fetch failure destroyed the whole plan.** Now the route is replanned in
-still air and returned with a `wind_note` saying so. A degraded answer beats no
-answer.
-
-**Open-Meteo returned 429s** on batches of 100 coordinates. Reduced to 50, and
-the retry learned to read the server's own reason rather than assume one.
+**The map drew the wrong line.** The dashed reference course was drawn from two
+points, and Leaflet joins two points with a line that is straight *on screen* —
+a rhumb line, not a great circle. San Francisco to Dubai showed a "direct
+course" labelled 7,030 nm running across Africa, beside a route labelled 7,290
+nm that appeared to detour thousands of miles over the Arctic for nothing. The
+route was right; the line it was compared against was a different path. The
+course is now sampled at 64 points along the actual great circle.
 
 ## Scope
 
