@@ -5,19 +5,10 @@ mission request, an agent orchestrates real routing, weather, and airspace tools
 to produce a flight plan, plus a grounded preflight checklist and an interactive
 map.
 
-The core design principle is that **the model never does computation**. All
-routing, weather and airspace logic lives in deterministic Python functions that
+All routing, weather and airspace logic lives in deterministic Python functions that
 work independently of any model. The model decides which tool to call and
 synthesises the results — every number it reports comes from real tool output,
 and every checklist item from a document that can be opened.
-
-Building it turned that rule into a stricter one. Five separate failures were
-computations that came out right and were then corrupted in the last step —
-misread, mislabelled, reformatted, retyped. So the rule is now **the model never
-*derives* anything**: not arithmetic, not interpretation, not a unit conversion.
-Tool results state finished conclusions in prose, and anything a reader could
-draw the opposite conclusion from is a sentence rather than a value. The "Bugs
-worth recording" section below is mostly the evidence for that.
 
 ## Status
 
