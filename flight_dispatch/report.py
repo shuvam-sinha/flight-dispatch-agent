@@ -365,32 +365,62 @@ footer { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid #e3e7eb;
 """
 
 
-_FIGURE_UNITS = {
-    "gal": ("fuel", "reserve"),
-    "lb": ("load", "payload", "weight"),
-    "ft": ("altitude", "ceiling", "elevation"),
-    "nm": ("distance", "range"),
-    "h": ("hours",),
-    "min": ("minutes",),
+# THE UNIT IS THE SUFFIX, NOT A WORD SOMEWHERE IN THE NAME. Guessing
+# from substrings matched "reserve" to gallons before "minutes" matched
+# minutes, so `reserve_minutes: 45` was rendered "45 gal" -- a 45-gallon
+# reserve in an aircraft that carries 2,835. Every figure name ends in
+# its unit, so the suffix is exact where a substring is a guess.
+_UNIT_SUFFIXES = (
+    ("_gal", "gal"),
+    ("_lb", "lb"),
+    ("_ft", "ft"),
+    ("_nm", "nm"),
+    ("_hours", "h"),
+    ("_minutes", "min"),
+    ("_kt", "kt"),
+)
+
+# Two fields whose names differ only by unit collapse to the same
+# heading once the suffix is stripped -- `reserve_gal` and
+# `reserve_minutes` both became "Reserve", printed twice with different
+# numbers and no way to tell which was which.
+_FIGURE_LABELS = {
+    "reserve_gal": "Reserve fuel",
+    "reserve_minutes": "Reserve time",
+    "usable_fuel_gal": "Fuel capacity",
+    "max_fuel_with_typical_payload_gal": "Fuel at typical payload",
+    "still_air_range_nm": "Still-air range",
 }
+
+
+def _unit(key: str) -> str:
+    """The unit a figure's name declares, or "" if it names none."""
+    for suffix, unit in _UNIT_SUFFIXES:
+        if key.endswith(suffix):
+            return unit
+    return ""
 
 
 def _label(key: str) -> str:
     """A field name as a heading a person would write."""
-    return key.replace("_", " ").replace(" ft", "").replace(" gal", "").replace(
-        " lb", ""
-    ).replace(" nm", "").replace(" hours", "").replace(" minutes", "").strip().capitalize()
+    if key in _FIGURE_LABELS:
+        return _FIGURE_LABELS[key]
+
+    name = key
+    for suffix, _ in _UNIT_SUFFIXES:
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name.replace("_", " ").strip().capitalize()
 
 
 def _figure(key: str, value: Any) -> str:
-    """A number with the unit its field name implies."""
+    """A number with the unit its field name declares."""
     if not isinstance(value, (int, float)):
         return str(value)
 
-    for unit, markers in _FIGURE_UNITS.items():
-        if any(marker in key for marker in markers):
-            return f"{value:,g} {unit}"
-    return f"{value:,g}"
+    unit = _unit(key)
+    return f"{value:,g} {unit}".rstrip()
 
 
 def _stat(label: str, value: str) -> str:

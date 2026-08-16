@@ -250,3 +250,66 @@ class TestGeneratedAt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFigureUnitsAndLabels(unittest.TestCase):
+    """THE BUG THIS FIXES.
+
+    Units were guessed from substrings, and "reserve" matched gallons
+    before "minutes" matched minutes -- so `reserve_minutes: 45` rendered
+    as "45 gal", a 45-gallon reserve in an aircraft carrying 2,835.
+    Stripping the suffix for the heading then collapsed `reserve_gal` and
+    `reserve_minutes` onto the same word, printed twice with different
+    numbers and no way to tell which was which.
+    """
+
+    def figure(self, key, value):
+        from flight_dispatch.report import _figure
+
+        return _figure(key, value)
+
+    def label(self, key):
+        from flight_dispatch.report import _label
+
+        return _label(key)
+
+    def test_the_reserve_that_was_wrong(self):
+        self.assertEqual(self.figure("reserve_minutes", 45), "45 min")
+        self.assertEqual(self.figure("reserve_gal", 2835), "2,835 gal")
+
+    def test_units_come_from_the_suffix(self):
+        for key, value, expected in (
+            ("usable_fuel_gal", 84535, "84,535 gal"),
+            ("useful_load_lb", 657300, "657,300 lb"),
+            ("cruise_altitude_ft", 39000, "39,000 ft"),
+            ("direct_distance_nm", 7030.4, "7,030.4 nm"),
+            ("endurance_hours", 20.4, "20.4 h"),
+        ):
+            with self.subTest(key):
+                self.assertEqual(self.figure(key, value), expected)
+
+    def test_a_name_with_no_unit_gets_none(self):
+        self.assertEqual(self.figure("waypoint_count", 22), "22")
+
+    def test_non_numeric_values_pass_through(self):
+        self.assertEqual(self.figure("note_text", "hello"), "hello")
+
+    def test_labels_are_unique_across_the_real_figures(self):
+        # The collision that produced two headings reading "Reserve".
+        from flight_dispatch.tools import _flight_figures
+        from flight_dispatch.aircraft import get_aircraft
+        from flight_dispatch.data_loader import load_airports
+
+        airports = load_airports()
+        figures = _flight_figures(
+            get_aircraft("a388"), airports["KSFO"], airports["OMDB"]
+        )
+        labels = [self.label(key) for key in figures]
+        self.assertEqual(len(labels), len(set(labels)), sorted(labels))
+
+    def test_the_two_reserves_are_distinguishable(self):
+        self.assertNotEqual(self.label("reserve_gal"), self.label("reserve_minutes"))
+
+    def test_labels_read_as_headings(self):
+        self.assertEqual(self.label("cruise_altitude_ft"), "Cruise altitude")
+        self.assertEqual(self.label("origin_elevation_ft"), "Origin elevation")
