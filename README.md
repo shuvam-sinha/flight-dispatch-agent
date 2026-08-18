@@ -18,20 +18,20 @@ restricted-airspace avoidance, a virtual routing grid for oceanic legs, a
 conversational agent running against two local model backends, a
 retrieval-grounded preflight checklist, and a self-contained HTML report.
 
-```
-you> plan a flight from Chicago Executive to Minneapolis in a Cirrus
+## Demo
 
-  · find_airport(query="Chicago Executive")   -> KPWK  Chicago Executive
-  · find_airport(query="Minneapolis")         -> KMSP  Minneapolis–Saint Paul Intl
-  · plan_flight(origin="KPWK", dest="KMSP", aircraft="sr22")
-        KPWK LNR LSE RGK KMSP — 285.3 nm, 1h44m, 42.2 gal
+**The agent, in the terminal.** Plain-language requests, the tool calls each one
+triggers, and answers where every number came from a Python function.
 
-KPWK to KMSP is 285 nm direct. Routing via Lone Rock, La Crosse and Red
-Wing gives 285.3 nm — essentially the direct line — and a Cirrus SR22
-covers it in about 1 hour 44 minutes on 42.2 gallons including reserve.
-```
+<!-- VIDEO 1: replace this line with the github.com/user-attachments/assets/... URL -->
 
-Every number in that reply came out of a Python function, not the model.
+**The dispatch report.** KJFK to EGLL in a 787: the route, the map with the
+restricted airspace it routed around, the computed figures, and a preflight
+checklist where every item cites a procedure document.
+
+<!-- VIDEO 2: replace this line with the github.com/user-attachments/assets/... URL -->
+
+The commands and prompts being run are in [Usage](docs/usage.md).
 
 ## Setup
 
