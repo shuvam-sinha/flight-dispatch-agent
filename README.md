@@ -32,6 +32,11 @@ checklist where every item cites a procedure document.
 
 https://github.com/user-attachments/assets/cdfe37b0-b406-4e5b-885a-3adaa49df9f8
 
+**The conversation history.** KSFO to OMDB first in an a380, then a 777, with the
+LLM keeping track of conversation history.
+
+<img width="1136" height="727" alt="Conversation_History" src="https://github.com/user-attachments/assets/67da638f-94ed-4075-b11b-296d394201cd" />
+
 The commands and prompts being run are in [Usage](docs/usage.md).
 
 ## Setup
