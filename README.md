@@ -1,5 +1,4 @@
 
-https://github.com/user-attachments/assets/ea1f78e9-f252-4659-ae59-e06499f9109a
 # Flight Dispatch Agent
 
 An AI flight-dispatch assistant for pilots/dispatchers: given a natural-language
@@ -31,7 +30,9 @@ https://github.com/user-attachments/assets/acae3039-d5b9-463d-809e-2f989330171f
 restricted airspace it routed around, the computed figures, and a preflight
 checklist where every item cites a procedure document.
 
-<!-- VIDEO 2: replace this line with the github.com/user-attachments/assets/... URL -->
+
+
+
 
 The commands and prompts being run are in [Usage](docs/usage.md).
 
