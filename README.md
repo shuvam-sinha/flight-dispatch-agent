@@ -24,7 +24,7 @@ retrieval-grounded preflight checklist, and a self-contained HTML report.
 **The agent, in the terminal.** Plain-language requests, the tool calls each one
 triggers, and answers where every number came from a Python function.
 
-https://github.com/user-attachments/assets/7e4344bc-6dd7-47ce-9fdd-b5df92ed2914
+https://github.com/user-attachments/assets/af4109be-9fc8-45cf-865e-0d7f1f71b4c5
 
 **The dispatch report.** KJFK to EGLL in a 787: the route, the map with the
 restricted airspace it routed around, the computed figures, and a preflight
