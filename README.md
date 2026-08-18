@@ -1,3 +1,5 @@
+
+https://github.com/user-attachments/assets/ea1f78e9-f252-4659-ae59-e06499f9109a
 # Flight Dispatch Agent
 
 An AI flight-dispatch assistant for pilots/dispatchers: given a natural-language
@@ -23,7 +25,7 @@ retrieval-grounded preflight checklist, and a self-contained HTML report.
 **The agent, in the terminal.** Plain-language requests, the tool calls each one
 triggers, and answers where every number came from a Python function.
 
-<!-- VIDEO 1: replace this line with the github.com/user-attachments/assets/... URL -->
+https://github.com/user-attachments/assets/acae3039-d5b9-463d-809e-2f989330171f
 
 **The dispatch report.** KJFK to EGLL in a 787: the route, the map with the
 restricted airspace it routed around, the computed figures, and a preflight
